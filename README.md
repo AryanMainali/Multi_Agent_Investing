@@ -39,7 +39,7 @@ Optional AI keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`) ca
 - `agents/data_agent.py` & `agents/market_agent.py` (**1. Market Data**): real Yahoo Finance OHLCV validation, technical indicators, trend, volume, and volatility state.
 - `agents/research_agent.py` (**2. Research (AI)**): Yahoo Finance news & company fundamentals gatherer with LLM / rule-assisted sentiment, catalysts, and risk synthesis.
 - `agents/strategy_agent.py` & `agents/analyst_agent.py` (**3. Strategy**): combines Market Data + AI Research + multi-strategy signals into a scored candidate (`SUGGEST_LONG` or `AVOID_OR_WAIT`).
-- `agents/risk_agent.py` (**4. Risk Gate**): deterministic hard caps on position allocation, per-trade nominal loss, whole shares, volatility, and liquidity. Rejects failing ideas to `dropped_ideas` in SQLite.
+- `agents/risk_agent.py` (**4. Risk Gate**): deterministic hard caps on position allocation, per-trade nominal loss, total open portfolio heat, sector concentration, whole shares, volatility, and liquidity. Rejects failing ideas to `dropped_ideas` in SQLite.
 - `agents/report_agent.py` (**5. Report (AI)**): generates a plain-English suggestion brief (only when Risk Gate passes) for manual human review.
 - `agents/monitor_agent.py` (**6. Monitor Agent**): audits every upstream agent, verifies risk-cap invariants, flags cross-agent divergences or stale bars, and enforces manual-only report compliance.
 - `core/strategies.py` & `core/backtest.py`: 7 past-only strategies (`SMA 20/50`, `EMA 12/26`, `MACD`, `RSI 14`, `Bollinger Bands`, `Donchian 20/10`, `Buy & Hold`) and side-by-side historical backtester.

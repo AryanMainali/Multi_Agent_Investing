@@ -1,6 +1,8 @@
+import sqlite3
 import numpy as np
 import pandas as pd
 import pytest
+from agents.risk_agent import evaluate_risk_gate, get_risk_policy
 from core.portfolio import evaluate_paper_portfolio, get_paper_cash_summary
 from core.storage import close_paper_position, list_paper_positions, open_paper_position
 
@@ -75,3 +77,95 @@ def test_open_mark_to_market_alerts_and_manual_close(tmp_path):
     assert after_close['total_equity'] == 10150.0
     assert len(after_close['open_positions']) == 0
     assert len(after_close['closed_positions']) == 1
+
+
+def test_portfolio_heat_and_sector_diversification_gates():
+    policy = get_risk_policy('medium')  # 4% max heat ($400 on $10k), max 2 per sector
+    idea = {'action': 'SUGGEST_LONG', 'conviction_score': 3, 'entry_reference_price': 100.0, 'summary': 'ok'}
+    market = {'volatility_20_pct': 22.0, 'volume_ratio': 1.1}
+    research = {'sentiment': 'BULLISH', 'sentiment_score': 0.5, 'fundamentals': {'sector': 'Technology'}}
+
+    # Case 1: $370 of $400 heat already used -> only $30 heat left -> at $5 stop risk/share ($100 * 5%), caps at 6 shares!
+    partial_gate = evaluate_risk_gate(
+        strategy_idea=idea,
+        market=market,
+        research=research,
+        bankroll=10000.0,
+        policy=policy,
+        open_portfolio_risk=370.0,
+        sector_counts={'Technology': 1},
+    )
+    assert partial_gate['passed'] is True
+    assert partial_gate['shares'] == 6
+    assert partial_gate['open_portfolio_risk'] + partial_gate['nominal_risk'] <= 400.0
+
+    # Case 2: $398 of $400 heat already used (< $5 needed for 1 share) -> DROPPED by portfolio heat cap
+    maxed_heat_gate = evaluate_risk_gate(
+        strategy_idea=idea,
+        market=market,
+        research=research,
+        bankroll=10000.0,
+        policy=policy,
+        open_portfolio_risk=398.0,
+        sector_counts={'Technology': 1},
+    )
+    assert maxed_heat_gate['passed'] is False
+    assert any('Portfolio heat cap reached' in r for r in maxed_heat_gate['drop_reasons'])
+
+    # Case 3: Already holding 2 Technology positions -> 3rd Tech stock DROPPED, Healthcare stock PASSES
+    sector_blocked_gate = evaluate_risk_gate(
+        strategy_idea=idea,
+        market=market,
+        research=research,
+        bankroll=10000.0,
+        policy=policy,
+        open_portfolio_risk=150.0,
+        sector_counts={'Technology': 2},
+    )
+    assert sector_blocked_gate['passed'] is False
+    assert any('Sector concentration cap reached' in r for r in sector_blocked_gate['drop_reasons'])
+
+    healthcare_gate = evaluate_risk_gate(
+        strategy_idea=idea,
+        market=market,
+        research={'sentiment': 'BULLISH', 'sentiment_score': 0.5, 'fundamentals': {'sector': 'Healthcare'}},
+        bankroll=10000.0,
+        policy=policy,
+        open_portfolio_risk=150.0,
+        sector_counts={'Technology': 2},
+    )
+    assert healthcare_gate['passed'] is True
+
+
+def test_legacy_paper_positions_schema_auto_migrates_sector_column(tmp_path):
+    db = tmp_path / 'legacy.db'
+    with sqlite3.connect(db) as conn:
+        conn.execute('''CREATE TABLE paper_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            opened_at_utc TEXT NOT NULL,
+            closed_at_utc TEXT,
+            status TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            shares INTEGER NOT NULL,
+            entry_price REAL NOT NULL,
+            stop_price REAL NOT NULL,
+            target_price REAL NOT NULL,
+            exit_price REAL,
+            realized_pnl REAL,
+            notes TEXT NOT NULL
+        )''')
+    pos_id = open_paper_position(
+        ticker='JPM',
+        strategy='SMA 20/50 Crossover',
+        shares=5,
+        entry_price=190.0,
+        stop_price=180.5,
+        target_price=209.0,
+        sector='Financial Services',
+        db_path=db,
+    )
+    assert pos_id == 1
+    summary = get_paper_cash_summary(10000.0, db_path=db)
+    assert summary['sector_counts'] == {'Financial Services': 1}
+

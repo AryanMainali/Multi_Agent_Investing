@@ -49,11 +49,15 @@ def main():
     keys = list(STRATEGIES.keys()) if args.strategy == 'all' else [args.strategy]
 
     portfolio = evaluate_paper_portfolio(starting_bankroll=bankroll)
-    print(f'\n=== PAPER PORTFOLIO ({risk_level.upper()} RISK, Equity ${portfolio["total_equity"]:,.2f}, Cash ${portfolio["available_cash"]:,.2f}) ===')
+    print(
+        f'\n=== PAPER PORTFOLIO ({risk_level.upper()} RISK | Equity ${portfolio["total_equity"]:,.2f} | '
+        f'Cash ${portfolio["available_cash"]:,.2f} | Heat {portfolio["open_portfolio_heat_pct"]:.2f}%/{policy.max_portfolio_heat * 100:g}%) ==='
+    )
     print(
         f'max_allocation: {policy.max_allocation * 100:g}% | '
         f'max_risk_per_trade: {policy.max_risk_fraction * 100:g}% | '
         f'stop_loss: {policy.stop_loss_fraction * 100:g}% | '
+        f'max_per_sector: {policy.max_positions_per_sector} | '
         f'open_positions: {len(portfolio["open_positions"])}'
     )
     for alert in portfolio['alerts']:
@@ -68,9 +72,13 @@ def main():
             strategy=primary_strategy,
             period=args.period,
             source='yahoo',
+            available_cash=portfolio['available_cash'],
+            already_held=(ticker in {p['ticker'] for p in portfolio['open_positions']}),
+            open_portfolio_risk=portfolio['open_portfolio_risk'],
+            sector_counts=portfolio['sector_counts'],
         )
     else:
-        print(f"\nScanning {args.scan.upper()} universe for top {args.top_k} candidates...")
+        print(f"\nScanning {args.scan.upper()} universe for top {args.top_k} sector-diversified candidates...")
         scan_res = scan_market_and_suggest(
             scope=args.scan,
             bankroll=bankroll,
@@ -78,6 +86,10 @@ def main():
             primary_strategy=primary_strategy,
             top_k=args.top_k,
             history_period=args.period,
+            available_cash=portfolio['available_cash'],
+            open_tickers={p['ticker'] for p in portfolio['open_positions']},
+            open_portfolio_risk=portfolio['open_portfolio_risk'],
+            sector_counts=portfolio['sector_counts'],
         )
         print(
             f"Scanned {scan_res['valid_data_count']}/{scan_res['universe_size']} stocks | "

@@ -97,28 +97,42 @@ class MonitorAgent:
             'strategy_consensus': f"{strategy_idea.get('bullish_strategies_count')}/{strategy_idea.get('total_active_strategies')}",
         }
 
-        # 4. Check [4. Risk Gate] mathematical invariants
+        # 4. Check [4. Risk Gate] mathematical invariants (single-trade + portfolio heat & sector caps)
         notional = float(risk_gate.get('notional', 0.0))
         nom_risk = float(risk_gate.get('nominal_risk', 0.0))
         shares = int(risk_gate.get('shares', 0))
         stop_price = float(risk_gate.get('stop_price', 0.0))
         entry_price = float(strategy_idea.get('entry_reference_price', 0.0))
+        open_risk = float(risk_gate.get('open_portfolio_risk', 0.0))
+        sector = str(risk_gate.get('sector', 'Unknown'))
+        sector_open_count = int(risk_gate.get('sector_open_count', 0))
 
         alloc_cap_ok = notional <= bankroll * policy.max_allocation + 0.05
         risk_cap_ok = nom_risk <= bankroll * policy.max_risk_fraction + 0.05
+        heat_cap_ok = (
+            not risk_gate.get('passed')
+            or (open_risk + nom_risk) <= bankroll * policy.max_portfolio_heat + 0.05
+        )
+        sector_cap_ok = (
+            not risk_gate.get('passed')
+            or sector == 'Unknown'
+            or sector_open_count < int(policy.max_positions_per_sector)
+        )
         stop_ok = 0 < stop_price < entry_price
         gate_consistent = (
             (risk_gate['passed'] and shares >= 1 and len(risk_gate.get('drop_reasons', [])) == 0)
             or (not risk_gate['passed'] and len(risk_gate.get('drop_reasons', [])) >= 1)
         )
-        risk_invariants_ok = alloc_cap_ok and risk_cap_ok and stop_ok and gate_consistent
+        risk_invariants_ok = alloc_cap_ok and risk_cap_ok and heat_cap_ok and sector_cap_ok and stop_ok and gate_consistent
         if not risk_invariants_ok:
-            critical_errors.append('Risk Gate mathematical cap or pass/drop consistency invariant failed.')
+            critical_errors.append('Risk Gate mathematical cap, portfolio heat, or sector diversification invariant failed.')
         agent_checks['4_risk_gate'] = {
             'status': 'OK' if risk_invariants_ok else 'CRITICAL',
             'passed_gate': bool(risk_gate.get('passed')),
             'alloc_cap_verified': alloc_cap_ok,
             'risk_cap_verified': risk_cap_ok,
+            'heat_cap_verified': heat_cap_ok,
+            'sector_cap_verified': sector_cap_ok,
         }
 
         # 5. Check [5. Report (AI)] (when Risk Gate passed and report was generated)

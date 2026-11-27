@@ -88,3 +88,45 @@ def test_scanner_filters_unaffordable_stocks_and_shortlists_top_k(monkeypatch, t
     assert scan_res['passed_count'] >= 4
     assert 'BKNG' not in scan_res['shortlist_summary_df']['Ticker'].values
     assert scan_res['candidates'][0]['workflow']['outcome'] == 'SUGGESTION_READY'
+
+
+def test_scanner_diversifies_shortlist_across_sectors(monkeypatch, tmp_path):
+    # 4 Tech stocks + JPM (Financials) + JNJ (Healthcare) + XOM (Energy) under Low risk (max 1 stock/sector)
+    ticker_specs = {
+        'NVDA': (105.0, 0.55),
+        'AAPL': (150.0, 0.50),
+        'AMD': (120.0, 0.48),
+        'ORCL': (130.0, 0.46),
+        'JPM': (180.0, 0.40),
+        'JNJ': (155.0, 0.35),
+        'XOM': (110.0, 0.32),
+    }
+    batch_df = _build_multi_ticker_batch(ticker_specs)
+    monkeypatch.setattr(yf, 'download', lambda *args, **kwargs: batch_df)
+
+    class DummyTicker:
+        def __init__(self, symbol):
+            self.symbol = symbol
+            self.info = {'shortName': f'{symbol} Corp', 'trailingPE': 20.0}
+
+        def history(self, period='2y', interval='1d', auto_adjust=True):
+            return extract_symbol_bars(batch_df, self.symbol, list(ticker_specs.keys()))
+
+        def get_news(self, count=6):
+            return [{'title': f'{self.symbol} strong profit growth', 'publisher': 'Yahoo Finance'}]
+
+    monkeypatch.setattr(yf, 'Ticker', DummyTicker)
+
+    scan_res = scan_market_and_suggest(
+        scope='sp100',
+        bankroll=25000.0,
+        policy=get_risk_policy('low'),  # max 1 position per sector!
+        top_k=4,
+        tickers_override=list(ticker_specs.keys()),
+        db_path=tmp_path / 'div.db',
+    )
+    sectors = scan_res['shortlist_summary_df']['Sector'].tolist()
+    # Under max 1 per sector with 4 distinct sectors available, all 4 shortlisted candidates come from distinct sectors!
+    assert len(sectors) == 4
+    assert len(set(sectors)) == 4
+

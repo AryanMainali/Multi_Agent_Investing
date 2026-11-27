@@ -60,6 +60,8 @@ def run_suggestion_workflow(
     log_to_db: bool = True,
     available_cash: float | None = None,
     already_held: bool = False,
+    open_portfolio_risk: float = 0.0,
+    sector_counts: dict[str, int] | None = None,
 ):
     """Run the full 6-agent suggestion workflow ending in either Drop & Log or a Plain-English Report."""
     if bankroll <= 0:
@@ -93,6 +95,8 @@ def run_suggestion_workflow(
         policy=active_policy,
         available_cash=available_cash,
         already_held=already_held,
+        open_portfolio_risk=open_portfolio_risk,
+        sector_counts=sector_counts,
     )
 
     monitor_agent = MonitorAgent()

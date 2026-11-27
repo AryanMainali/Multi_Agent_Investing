@@ -7,6 +7,7 @@ to transparent rule-assisted synthesis over the real fetched data otherwise.
 from dataclasses import dataclass
 import yfinance as yf
 from core.llm import LLMConfig, generate_text, parse_json_object
+from core.universe import get_known_sector
 
 POSITIVE_WORDS = {
     'beat', 'beats', 'surge', 'surges', 'rally', 'upgrade', 'upgraded', 'growth',
@@ -190,6 +191,10 @@ class ResearchAgent:
 
         headlines = _extract_headlines(raw_news)
         fundamentals = _extract_fundamentals(raw_info)
+        if 'sector' not in fundamentals:
+            known_sec = get_known_sector(symbol)
+            if known_sec != 'Unknown':
+                fundamentals['sector'] = known_sec
         baseline = _deterministic_synthesis(symbol, market, headlines, fundamentals)
 
         system_prompt = (

@@ -97,6 +97,49 @@ def fetch_sp500_tickers_live(timeout: float = 6.0) -> list[str]:
     return list(SP500_FALLBACK_TICKERS)
 
 
+# GICS sector mapping for S&P 100 constituents (fast batch-scan diversification & fallback)
+KNOWN_SECTORS: dict[str, str] = {
+    'AAPL': 'Technology', 'ADBE': 'Technology', 'AMD': 'Technology', 'AVGO': 'Technology',
+    'CRM': 'Technology', 'CSCO': 'Technology', 'IBM': 'Technology', 'INTC': 'Technology',
+    'INTU': 'Technology', 'MSFT': 'Technology', 'NOW': 'Technology', 'NVDA': 'Technology',
+    'ORCL': 'Technology', 'PLTR': 'Technology', 'QCOM': 'Technology', 'TXN': 'Technology',
+    'ACN': 'Technology',
+    'GOOG': 'Communication Services', 'GOOGL': 'Communication Services', 'META': 'Communication Services',
+    'NFLX': 'Communication Services', 'DIS': 'Communication Services', 'CMCSA': 'Communication Services',
+    'CHTR': 'Communication Services', 'T': 'Communication Services', 'TMUS': 'Communication Services',
+    'VZ': 'Communication Services',
+    'AMZN': 'Consumer Cyclical', 'BKNG': 'Consumer Cyclical', 'GM': 'Consumer Cyclical',
+    'HD': 'Consumer Cyclical', 'LOW': 'Consumer Cyclical', 'MCD': 'Consumer Cyclical',
+    'NKE': 'Consumer Cyclical', 'SBUX': 'Consumer Cyclical', 'TSLA': 'Consumer Cyclical',
+    'COST': 'Consumer Defensive', 'CL': 'Consumer Defensive', 'KO': 'Consumer Defensive',
+    'MDLZ': 'Consumer Defensive', 'MO': 'Consumer Defensive', 'PEP': 'Consumer Defensive',
+    'PG': 'Consumer Defensive', 'PM': 'Consumer Defensive', 'TGT': 'Consumer Defensive',
+    'WMT': 'Consumer Defensive',
+    'AIG': 'Financial Services', 'AXP': 'Financial Services', 'BAC': 'Financial Services',
+    'BK': 'Financial Services', 'BLK': 'Financial Services', 'BRK-B': 'Financial Services',
+    'C': 'Financial Services', 'COF': 'Financial Services', 'GS': 'Financial Services',
+    'JPM': 'Financial Services', 'MA': 'Financial Services', 'MET': 'Financial Services',
+    'MS': 'Financial Services', 'PYPL': 'Financial Services', 'SCHW': 'Financial Services',
+    'USB': 'Financial Services', 'V': 'Financial Services', 'WFC': 'Financial Services',
+    'ABBV': 'Healthcare', 'ABT': 'Healthcare', 'AMGN': 'Healthcare', 'BMY': 'Healthcare',
+    'CVS': 'Healthcare', 'DHR': 'Healthcare', 'GILD': 'Healthcare', 'ISRG': 'Healthcare',
+    'JNJ': 'Healthcare', 'LLY': 'Healthcare', 'MDT': 'Healthcare', 'MRK': 'Healthcare',
+    'PFE': 'Healthcare', 'TMO': 'Healthcare', 'UNH': 'Healthcare',
+    'BA': 'Industrials', 'CAT': 'Industrials', 'DE': 'Industrials', 'EMR': 'Industrials',
+    'FDX': 'Industrials', 'GD': 'Industrials', 'GE': 'Industrials', 'HON': 'Industrials',
+    'LMT': 'Industrials', 'MMM': 'Industrials', 'RTX': 'Industrials', 'UNP': 'Industrials',
+    'UPS': 'Industrials',
+    'COP': 'Energy', 'CVX': 'Energy', 'XOM': 'Energy',
+    'DUK': 'Utilities', 'NEE': 'Utilities', 'SO': 'Utilities',
+    'AMT': 'Real Estate', 'SPG': 'Real Estate',
+    'LIN': 'Basic Materials',
+}
+
+
+def get_known_sector(symbol: str) -> str:
+    return KNOWN_SECTORS.get(normalize_yahoo_symbol(symbol), 'Unknown')
+
+
 def get_universe_tickers(scope: str = 'sp100', refresh_web: bool = True) -> list[str]:
     """Return real ticker symbols for 'sp100' or 'sp500'."""
     key = scope.strip().lower()

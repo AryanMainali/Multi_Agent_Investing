@@ -1,4 +1,4 @@
-"""Paper portfolio valuation, cash ledger, and advisory exit/stop alert monitor.
+"""Paper portfolio valuation, cash ledger, portfolio heat, sector exposure, and advisory alerts.
 
 Strictly advisory: marks open paper positions to real Yahoo Finance daily bars and
 surfaces alerts when a stop-loss, 2R target, or strategy exit signal is reached.
@@ -13,12 +13,20 @@ from core.indicators import enrich
 from core.scanner import extract_symbol_bars
 from core.storage import list_paper_positions
 from core.strategies import STRATEGIES
+from core.universe import get_known_sector
 
 NAME_TO_STRATEGY_KEY = {spec.name: key for key, spec in STRATEGIES.items()}
 
 
+def _resolve_position_sector(pos: dict) -> str:
+    sec = str(pos.get('sector') or '').strip()
+    if sec and sec != 'Unknown':
+        return sec
+    return get_known_sector(pos['ticker'])
+
+
 def get_paper_cash_summary(starting_bankroll: float, db_path: Path | None = None) -> dict:
-    """Compute realized P&L, open cost basis, available cash, and open ticker set without network calls."""
+    """Compute cash, open stop-loss risk (portfolio heat), and sector counts without network calls."""
     if starting_bankroll <= 0:
         raise ValueError('Starting bankroll must be positive')
     all_positions = list_paper_positions(db_path=db_path)
@@ -29,10 +37,26 @@ def get_paper_cash_summary(starting_bankroll: float, db_path: Path | None = None
     realized_pnl = round(sum(float(p['realized_pnl'] or 0.0) for p in closed_pos), 2)
     available_cash = round(float(starting_bankroll) + realized_pnl - open_cost_basis, 2)
 
+    open_portfolio_risk = round(
+        sum(max(0.0, (float(p['entry_price']) - float(p['stop_price'])) * int(p['shares'])) for p in open_pos),
+        2,
+    )
+    open_portfolio_heat_pct = round((open_portfolio_risk / float(starting_bankroll)) * 100.0, 2)
+
+    sector_counts: dict[str, int] = {}
+    for p in open_pos:
+        sec = _resolve_position_sector(p)
+        p['sector'] = sec
+        if sec != 'Unknown':
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+
     return {
         'starting_bankroll': round(float(starting_bankroll), 2),
         'available_cash': available_cash,
         'open_cost_basis': open_cost_basis,
+        'open_portfolio_risk': open_portfolio_risk,
+        'open_portfolio_heat_pct': open_portfolio_heat_pct,
+        'sector_counts': sector_counts,
         'realized_pnl': realized_pnl,
         'open_tickers': {p['ticker'] for p in open_pos},
         'open_positions': open_pos,
@@ -78,13 +102,16 @@ def evaluate_paper_portfolio(
     alerts = []
     open_market_value = 0.0
     unrealized_pnl_total = 0.0
+    sector_agg: dict[str, dict] = {}
 
     for pos in open_pos:
         sym = pos['ticker']
+        sec = _resolve_position_sector(pos)
         shares = int(pos['shares'])
         entry = float(pos['entry_price'])
         stop = float(pos['stop_price'])
         target = float(pos['target_price'])
+        pos_risk = round(max(0.0, (entry - stop) * shares), 2)
         bars = known_bars.get(sym)
 
         strategy_exit = False
@@ -104,6 +131,14 @@ def evaluate_paper_portfolio(
         unrl_pct = round((curr_price / entry - 1.0) * 100.0, 2)
         open_market_value += mkt_val
         unrealized_pnl_total += unrl_pnl
+
+        bucket = sector_agg.setdefault(
+            sec,
+            {'Sector': sec, 'Open Positions': 0, 'Market Value ($)': 0.0, 'Open Stop Risk ($)': 0.0},
+        )
+        bucket['Open Positions'] += 1
+        bucket['Market Value ($)'] = round(bucket['Market Value ($)'] + mkt_val, 2)
+        bucket['Open Stop Risk ($)'] = round(bucket['Open Stop Risk ($)'] + pos_risk, 2)
 
         if curr_price <= stop or last_low <= stop:
             alert_status = 'STOP BREACHED — Review manual exit'
@@ -131,6 +166,8 @@ def evaluate_paper_portfolio(
 
         enriched_open.append({
             **pos,
+            'sector': sec,
+            'open_stop_risk': pos_risk,
             'current_price': curr_price,
             'market_value': mkt_val,
             'unrealized_pnl': unrl_pnl,
@@ -142,11 +179,16 @@ def evaluate_paper_portfolio(
     unrealized_pnl_total = round(unrealized_pnl_total, 2)
     total_equity = round(summary['available_cash'] + open_market_value, 2)
     total_return_pct = round((total_equity / summary['starting_bankroll'] - 1.0) * 100.0, 2)
+    sector_breakdown = sorted(sector_agg.values(), key=lambda x: x['Market Value ($)'], reverse=True)
 
     return {
         'starting_bankroll': summary['starting_bankroll'],
         'available_cash': summary['available_cash'],
         'open_cost_basis': summary['open_cost_basis'],
+        'open_portfolio_risk': summary['open_portfolio_risk'],
+        'open_portfolio_heat_pct': summary['open_portfolio_heat_pct'],
+        'sector_counts': summary['sector_counts'],
+        'sector_breakdown': sector_breakdown,
         'open_market_value': open_market_value,
         'total_equity': total_equity,
         'unrealized_pnl': unrealized_pnl_total,

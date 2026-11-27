@@ -48,6 +48,7 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
         closed_at_utc TEXT,
         status TEXT NOT NULL,
         ticker TEXT NOT NULL,
+        sector TEXT NOT NULL DEFAULT 'Unknown',
         strategy TEXT NOT NULL,
         shares INTEGER NOT NULL,
         entry_price REAL NOT NULL,
@@ -57,6 +58,9 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
         realized_pnl REAL,
         notes TEXT NOT NULL
     )''')
+    existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(paper_positions)').fetchall()}
+    if 'sector' not in existing_cols:
+        conn.execute("ALTER TABLE paper_positions ADD COLUMN sector TEXT NOT NULL DEFAULT 'Unknown'")
 
 
 def save_decision(
@@ -190,10 +194,12 @@ def open_paper_position(
     stop_price: float,
     target_price: float,
     notes: str = '',
+    sector: str = 'Unknown',
     db_path: Path | None = None,
 ) -> int:
     """Record a manual paper long position in local SQLite."""
     symbol = ticker.strip().upper()
+    clean_sector = (sector or 'Unknown').strip() or 'Unknown'
     if int(shares) < 1:
         raise ValueError('Shares must be at least 1 whole share')
     if entry_price <= 0:
@@ -216,12 +222,13 @@ def open_paper_position(
 
         cur = conn.execute(
             '''INSERT INTO paper_positions
-            (opened_at_utc, closed_at_utc, status, ticker, strategy, shares,
+            (opened_at_utc, closed_at_utc, status, ticker, sector, strategy, shares,
              entry_price, stop_price, target_price, exit_price, realized_pnl, notes)
-            VALUES (?, NULL, 'OPEN', ?, ?, ?, ?, ?, ?, NULL, NULL, ?)''',
+            VALUES (?, NULL, 'OPEN', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)''',
             (
                 datetime.now(timezone.utc).isoformat(),
                 symbol,
+                clean_sector,
                 strategy,
                 int(shares),
                 round(float(entry_price), 4),
@@ -296,7 +303,7 @@ def list_paper_positions(status: str | None = None, db_path: Path | None = None)
     if not path.exists():
         return []
     cols = [
-        'id', 'opened_at_utc', 'closed_at_utc', 'status', 'ticker', 'strategy',
+        'id', 'opened_at_utc', 'closed_at_utc', 'status', 'ticker', 'sector', 'strategy',
         'shares', 'entry_price', 'stop_price', 'target_price', 'exit_price',
         'realized_pnl', 'notes',
     ]

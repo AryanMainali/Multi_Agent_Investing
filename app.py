@@ -1,5 +1,5 @@
 """Streamlit app: onboarding, autonomous S&P 100/500 market scanner, 6-agent suggestion workflow,
-multi-strategy backtesting, and live paper portfolio P&L + stop/exit alert tracker.
+portfolio heat & sector diversification caps, multi-strategy backtesting, and live paper portfolio tracker.
 
 Core Design Rule: Agents only suggest. Humans decide and trade manually.
 """
@@ -32,10 +32,10 @@ RISK_OPTIONS = [
 ]
 
 RISK_DESCRIPTIONS = {
-    'Low (Conservative)': 'Up to 10% per position · 0.5% max portfolio risk per trade · 4% protective stop-loss',
-    'Medium (Moderate)': 'Up to 20% per position · 1.0% max portfolio risk per trade · 5% protective stop-loss',
-    'High (Aggressive)': 'Up to 35% per position · 2.5% max portfolio risk per trade · 7% protective stop-loss',
-    'Custom': 'Define your own position allocation, per-trade risk budget, and stop-loss percentage',
+    'Low (Conservative)': '10% max alloc · 0.5% risk/trade · 4% stop · 2% max portfolio heat · max 1 stock/sector',
+    'Medium (Moderate)': '20% max alloc · 1.0% risk/trade · 5% stop · 4% max portfolio heat · max 2 stocks/sector',
+    'High (Aggressive)': '35% max alloc · 2.5% risk/trade · 7% stop · 8% max portfolio heat · max 3 stocks/sector',
+    'Custom': 'Define your own position allocation, per-trade risk, stop-loss, portfolio heat, and sector cap',
 }
 
 SCAN_SCOPE_LABELS = [
@@ -49,7 +49,14 @@ ACTIVE_STRATEGY_NAMES = [spec.name for spec in STRATEGIES.values() if spec.uses_
 TOP_K_SHORTLIST = 5
 
 
-def resolve_onboarding_policy(choice: str, alloc_pct: float, risk_pct: float, stop_pct: float) -> RiskPolicy:
+def resolve_onboarding_policy(
+    choice: str,
+    alloc_pct: float,
+    risk_pct: float,
+    stop_pct: float,
+    heat_pct: float,
+    max_per_sector: int,
+) -> RiskPolicy:
     if choice.startswith('Low'):
         return get_risk_policy('low')
     if choice.startswith('Medium'):
@@ -60,13 +67,15 @@ def resolve_onboarding_policy(choice: str, alloc_pct: float, risk_pct: float, st
         max_allocation=alloc_pct / 100.0,
         max_risk_fraction=risk_pct / 100.0,
         stop_loss_fraction=stop_pct / 100.0,
+        max_portfolio_heat=heat_pct / 100.0,
+        max_positions_per_sector=int(max_per_sector),
     )
 
 
 def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float, policy: RiskPolicy) -> None:
     """Render the 6-agent suggestion report, multi-strategy backtests, and manual paper decision entry."""
     source = 'yahoo'
-    st.subheader(f"1. Six-agent suggestion workflow — {result['ticker']}")
+    st.subheader(f"1. Six-agent suggestion workflow — {result['ticker']} ({result['risk']['sector']})")
     st.caption(
         f"As of {result['as_of']} | [1. Market Data] + [2. Research AI] → [3. Strategy] → [4. Risk Gate] → "
         f"{'[5. Report AI]' if result['risk']['passed'] else '[Drop & Log Reason]'} ← [6. Monitor Agent]"
@@ -87,7 +96,9 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
             st.markdown(result['report']['markdown_report'])
             st.caption(
                 f"Report generator mode: {result['report']['ai_mode']} | "
-                f"Audited by Monitor Agent ({result['monitor']['status']})"
+                f"Sector: {result['risk']['sector']} ({result['risk']['sector_open_count']}/{policy.max_positions_per_sector} open) | "
+                f"Projected portfolio heat: {result['risk']['projected_portfolio_heat_pct']:.2f}% / {policy.max_portfolio_heat * 100:g}% | "
+                f"Monitor: {result['monitor']['status']}"
             )
     else:
         st.warning(f"Risk Gate DROPPED {result['ticker']} — Idea rejected and logged to SQLite (no Report issued).")
@@ -113,7 +124,7 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
         res = result['research']
         st.markdown(
             f"**Sentiment:** `{res['sentiment']}` (score `{res['sentiment_score']:+.2f}`) · "
-            f"**Mode:** `{res['ai_mode']}`"
+            f"**Sector:** `{result['risk']['sector']}` · **Mode:** `{res['ai_mode']}`"
         )
         st.write(res['summary'])
         rc1, rc2 = st.columns(2)
@@ -306,19 +317,21 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
                 stop_price=float(result['risk']['stop_price']),
                 target_price=float(result['risk']['target_price']),
                 notes=reason,
+                sector=result['risk']['sector'],
             )
             save_decision(
                 result['ticker'],
                 source,
                 'APPROVE_PAPER',
                 result['market']['price'],
-                f"{formatted_reason} (Opened {int(shares_to_record)} paper shares)",
+                f"{formatted_reason} (Opened {int(shares_to_record)} paper shares, sector={result['risk']['sector']})",
             )
             st.session_state.scan_cache.clear()
             st.session_state.single_cache.clear()
             st.session_state.flash_success = (
                 f"Opened paper position: {int(shares_to_record)} share(s) of {result['ticker']} "
-                f"@ ${result['market']['price']:.2f} (Stop ${result['risk']['stop_price']:.2f})."
+                f"({result['risk']['sector']}) @ ${result['market']['price']:.2f} "
+                f"(Stop ${result['risk']['stop_price']:.2f})."
             )
             st.rerun()
         except ValueError as err:
@@ -374,23 +387,35 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
             st.caption('No workflow audits logged yet.')
 
 
-def render_paper_portfolio_tab(portfolio: dict) -> None:
-    """Render live paper portfolio valuation, advisory exit/stop alerts, manual close form, and trade history."""
+def render_paper_portfolio_tab(portfolio: dict, policy: RiskPolicy) -> None:
+    """Render live paper portfolio valuation, portfolio heat, sector concentration, alerts, and close form."""
     st.subheader('Live Paper Portfolio & P/L Tracker')
     st.caption(
         'Marks your manually opened paper positions against real Yahoo Finance closes. '
         'Advisory alerts notify you when a stop, target, or strategy exit is reached — positions are NEVER auto-closed.'
     )
 
-    p1, p2, p3, p4 = st.columns(4)
+    max_heat_dollars = portfolio['starting_bankroll'] * policy.max_portfolio_heat
+    p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric(
         'Total Paper Equity',
         f"${portfolio['total_equity']:,.2f}",
         f"{portfolio['total_return_pct']:+.2f}% vs ${portfolio['starting_bankroll']:,.2f}",
     )
-    p2.metric('Available Paper Cash', f"${portfolio['available_cash']:,.2f}", f"Invested cost: ${portfolio['open_cost_basis']:,.2f}", delta_color='off')
-    p3.metric('Unrealized P&L (Open)', f"${portfolio['unrealized_pnl']:+,.2f}")
-    p4.metric('Realized P&L (Closed)', f"${portfolio['realized_pnl']:+,.2f}")
+    p2.metric(
+        'Available Paper Cash',
+        f"${portfolio['available_cash']:,.2f}",
+        f"Cost basis: ${portfolio['open_cost_basis']:,.2f}",
+        delta_color='off',
+    )
+    p3.metric(
+        'Portfolio Heat (Stop Risk)',
+        f"${portfolio['open_portfolio_risk']:,.2f}",
+        f"{portfolio['open_portfolio_heat_pct']:.2f}% / {policy.max_portfolio_heat * 100:g}% (${max_heat_dollars:,.2f})",
+        delta_color='off',
+    )
+    p4.metric('Unrealized P&L (Open)', f"${portfolio['unrealized_pnl']:+,.2f}")
+    p5.metric('Realized P&L (Closed)', f"${portfolio['realized_pnl']:+,.2f}")
 
     if portfolio['alerts']:
         st.markdown('**Advisory Position Alerts (Manual Review Suggested)**')
@@ -402,6 +427,27 @@ def render_paper_portfolio_tab(portfolio: dict) -> None:
             else:
                 st.info(alert['message'])
 
+    if portfolio['sector_breakdown']:
+        st.markdown(f"### Sector Concentration (Max {policy.max_positions_per_sector} Open Position(s) / Sector)")
+        sec_rows = [
+            {
+                'Sector': row['Sector'],
+                'Slots Used': f"{row['Open Positions']} / {policy.max_positions_per_sector}",
+                'Market Value ($)': row['Market Value ($)'],
+                'Open Stop Risk ($)': row['Open Stop Risk ($)'],
+            }
+            for row in portfolio['sector_breakdown']
+        ]
+        st.dataframe(
+            pd.DataFrame(sec_rows),
+            width='stretch',
+            hide_index=True,
+            column_config={
+                'Market Value ($)': st.column_config.NumberColumn(format='$%.2f'),
+                'Open Stop Risk ($)': st.column_config.NumberColumn(format='$%.2f'),
+            },
+        )
+
     st.markdown('### Open Paper Positions')
     open_pos = portfolio['open_positions']
     if not open_pos:
@@ -411,6 +457,7 @@ def render_paper_portfolio_tab(portfolio: dict) -> None:
             {
                 'ID': p['id'],
                 'Ticker': p['ticker'],
+                'Sector': p['sector'],
                 'Strategy': p['strategy'],
                 'Shares': p['shares'],
                 'Entry ($)': p['entry_price'],
@@ -419,6 +466,7 @@ def render_paper_portfolio_tab(portfolio: dict) -> None:
                 'Unrealized P&L ($)': p['unrealized_pnl'],
                 'Return (%)': p['unrealized_pnl_pct'],
                 'Stop ($)': p['stop_price'],
+                'Stop Risk ($)': p['open_stop_risk'],
                 'Target ($)': p['target_price'],
                 'Advisory Status': p['alert_status'],
             }
@@ -435,13 +483,15 @@ def render_paper_portfolio_tab(portfolio: dict) -> None:
                 'Unrealized P&L ($)': st.column_config.NumberColumn(format='$%.2f'),
                 'Return (%)': st.column_config.NumberColumn(format='%.2f%%'),
                 'Stop ($)': st.column_config.NumberColumn(format='$%.2f'),
+                'Stop Risk ($)': st.column_config.NumberColumn(format='$%.2f'),
                 'Target ($)': st.column_config.NumberColumn(format='$%.2f'),
             },
         )
 
         st.markdown('#### Manually Close an Open Paper Position')
         pos_labels = [
-            f"#{p['id']} {p['ticker']} — {p['shares']} sh (Entry ${p['entry_price']:.2f} → Current ${p['current_price']:.2f} | {p['alert_status']})"
+            f"#{p['id']} {p['ticker']} ({p['sector']}) — {p['shares']} sh "
+            f"(Entry ${p['entry_price']:.2f} → Current ${p['current_price']:.2f} | {p['alert_status']})"
             for p in open_pos
         ]
         chosen_pos_label = st.selectbox('Select open paper position to close', options=pos_labels)
@@ -483,6 +533,7 @@ def render_paper_portfolio_tab(portfolio: dict) -> None:
             {
                 'ID': p['id'],
                 'Ticker': p['ticker'],
+                'Sector': p['sector'],
                 'Strategy': p['strategy'],
                 'Shares': p['shares'],
                 'Entry ($)': p['entry_price'],
@@ -522,7 +573,7 @@ if not st.session_state.onboarding_complete:
     st.subheader('Welcome! Set up your paper trading profile')
     st.write(
         'Enter your starting paper trading capital and risk tolerance. '
-        'Our agents will automatically scan S&P stocks to find candidates that fit your exact budget and risk rules.'
+        'Our agents will automatically scan S&P stocks to find diversified candidates that fit your exact budget, portfolio heat, and sector rules.'
     )
 
     default_bankroll = float(st.session_state.get('bankroll', 10000.0))
@@ -557,7 +608,7 @@ if not st.session_state.onboarding_complete:
 
     prev_policy: RiskPolicy = st.session_state.get('risk_policy', RiskPolicy())
     if risk_choice == 'Custom':
-        c_alloc, c_risk, c_stop = st.columns(3)
+        c_alloc, c_risk, c_stop, c_heat, c_sec = st.columns(5)
         with c_alloc:
             custom_alloc = st.slider(
                 'Max position allocation (%)',
@@ -568,7 +619,7 @@ if not st.session_state.onboarding_complete:
             )
         with c_risk:
             custom_risk = st.slider(
-                'Max portfolio risk per trade (%)',
+                'Max risk per trade (%)',
                 min_value=0.1,
                 max_value=10.0,
                 value=round(prev_policy.max_risk_fraction * 100, 1),
@@ -582,26 +633,59 @@ if not st.session_state.onboarding_complete:
                 value=round(prev_policy.stop_loss_fraction * 100, 1),
                 step=0.5,
             )
+        with c_heat:
+            custom_heat = st.slider(
+                'Max portfolio heat (%)',
+                min_value=0.5,
+                max_value=25.0,
+                value=round(prev_policy.max_portfolio_heat * 100, 1),
+                step=0.5,
+            )
+        with c_sec:
+            custom_sector_cap = st.slider(
+                'Max stocks / sector',
+                min_value=1,
+                max_value=10,
+                value=int(prev_policy.max_positions_per_sector),
+                step=1,
+            )
     else:
-        custom_alloc, custom_risk, custom_stop = 20.0, 1.0, 5.0
+        custom_alloc, custom_risk, custom_stop, custom_heat, custom_sector_cap = 20.0, 1.0, 5.0, 4.0, 2
 
-    preview_policy = resolve_onboarding_policy(risk_choice, custom_alloc, custom_risk, custom_stop)
+    preview_policy = resolve_onboarding_policy(
+        risk_choice,
+        custom_alloc,
+        custom_risk,
+        custom_stop,
+        custom_heat,
+        custom_sector_cap,
+    )
 
-    p1, p2, p3 = st.columns(3)
+    p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric(
-        'Max Position Allocation',
+        'Max Position Size',
         f"${input_bankroll * preview_policy.max_allocation:,.2f}",
         f"{preview_policy.max_allocation * 100:g}% of portfolio",
     )
     p2.metric(
-        'Max Risk Per Trade',
+        'Max Risk / Trade',
         f"${input_bankroll * preview_policy.max_risk_fraction:,.2f}",
         f"{preview_policy.max_risk_fraction * 100:g}% of portfolio",
     )
     p3.metric(
-        'Protective Stop-Loss',
+        'Max Portfolio Heat',
+        f"${input_bankroll * preview_policy.max_portfolio_heat:,.2f}",
+        f"{preview_policy.max_portfolio_heat * 100:g}% combined risk",
+    )
+    p4.metric(
+        'Sector Limit',
+        f"{preview_policy.max_positions_per_sector} stock(s)",
+        'Max per sector',
+    )
+    p5.metric(
+        'Protective Stop',
         f"{preview_policy.stop_loss_fraction * 100:g}%",
-        'Below entry fill price',
+        'Below entry fill',
     )
 
     if st.button('Scan Market & Start Paper Trading', type='primary'):
@@ -667,11 +751,18 @@ with st.sidebar:
         f"{len(cash_ledger['open_positions'])} open position(s)",
         delta_color='off',
     )
+    st.metric(
+        'Open portfolio heat',
+        f"{cash_ledger['open_portfolio_heat_pct']:.2f}% / {policy.max_portfolio_heat * 100:g}%",
+        f"${cash_ledger['open_portfolio_risk']:,.2f} at stop risk",
+        delta_color='off',
+    )
     st.write(f"**Risk tolerance:** {risk_label}")
     st.caption(
-        f"Max allocation: {policy.max_allocation * 100:g}% | "
-        f"Max risk/trade: {policy.max_risk_fraction * 100:g}% | "
-        f"Stop-loss: {policy.stop_loss_fraction * 100:g}%"
+        f"Max alloc: {policy.max_allocation * 100:g}% | "
+        f"Risk/trade: {policy.max_risk_fraction * 100:g}% | "
+        f"Stop: {policy.stop_loss_fraction * 100:g}% | "
+        f"Max {policy.max_positions_per_sector}/sector"
     )
     if st.button('Change Paper Amount / Risk', width='stretch'):
         st.session_state.onboarding_complete = False
@@ -717,6 +808,8 @@ with main_tab_discover:
             st.session_state.scan_scope,
             bankroll,
             cash_ledger['available_cash'],
+            cash_ledger['open_portfolio_risk'],
+            tuple(sorted(cash_ledger['sector_counts'].items())),
             tuple(sorted(cash_ledger['open_tickers'])),
             policy,
             primary_strategy_key,
@@ -741,6 +834,8 @@ with main_tab_discover:
                     llm_config=llm_cfg,
                     available_cash=cash_ledger['available_cash'],
                     open_tickers=cash_ledger['open_tickers'],
+                    open_portfolio_risk=cash_ledger['open_portfolio_risk'],
+                    sector_counts=cash_ledger['sector_counts'],
                     progress_callback=_update_prog,
                 )
                 st.session_state.scan_cache[scan_key] = scan_res
@@ -760,8 +855,13 @@ with main_tab_discover:
         st.subheader(f'Market Scan Overview — {scope_title} Discovery Funnel')
         f1, f2, f3, f4 = st.columns(4)
         f1.metric('Universe Scanned', f"{scan_res['valid_data_count']} / {scan_res['universe_size']} stocks")
-        f2.metric('Affordable Under Cash & Risk', f"{scan_res['affordable_count']} stocks")
-        f3.metric('Shortlisted for 6-Agent Eval', f"{len(scan_res['candidates'])} candidates")
+        f2.metric(
+            'Affordable Under Cash & Heat',
+            f"{scan_res['affordable_count']} stocks",
+            f"{scan_res.get('sector_blocked_count', 0)} at sector cap",
+            delta_color='off',
+        )
+        f3.metric('Diversified Shortlist', f"{len(scan_res['candidates'])} candidates")
         f4.metric(
             'Passed Risk Gate',
             f"{scan_res['passed_count']} ready",
@@ -771,12 +871,13 @@ with main_tab_discover:
 
         if not scan_res['candidates']:
             st.warning(
-                f"No new S&P stocks met whole-share affordability and technical filters "
-                f"under ${cash_ledger['available_cash']:,.2f} available cash ({risk_label}). "
+                f"No new S&P stocks met whole-share affordability, portfolio heat "
+                f"({cash_ledger['open_portfolio_heat_pct']:.2f}% / {policy.max_portfolio_heat * 100:g}%), "
+                f"and sector caps under ${cash_ledger['available_cash']:,.2f} available cash. "
                 f"Review your open paper positions or adjust capital/risk settings."
             )
         else:
-            st.markdown(f"**Top {len(scan_res['candidates'])} S&P candidates evaluated by the 6-agent pipeline**")
+            st.markdown(f"**Top {len(scan_res['candidates'])} sector-diversified S&P candidates evaluated by the 6-agent pipeline**")
             st.dataframe(
                 scan_res['shortlist_summary_df'],
                 width='stretch',
@@ -788,11 +889,12 @@ with main_tab_discover:
                 },
             )
 
-            with st.expander(f"View wider {scope_title} technical scan leaderboard (Top 25 affordable stocks)"):
+            with st.expander(f"View wider {scope_title} technical scan leaderboard (Top 25 eligible stocks)"):
                 st.dataframe(scan_res['leaderboard_df'].head(25), width='stretch', hide_index=True)
 
             candidate_options = [
-                f"{c['ticker']} — {'PASSED' if c['workflow']['risk']['passed'] else 'DROPPED'} "
+                f"{c['ticker']} ({c['workflow']['risk']['sector']}) — "
+                f"{'PASSED' if c['workflow']['risk']['passed'] else 'DROPPED'} "
                 f"(${c['workflow']['market']['price']:.2f} | Conviction {c['workflow']['strategy']['conviction_score']:+d}/5)"
                 for c in scan_res['candidates']
             ]
@@ -818,6 +920,8 @@ with main_tab_discover:
             ticker,
             bankroll,
             cash_ledger['available_cash'],
+            cash_ledger['open_portfolio_risk'],
+            tuple(sorted(cash_ledger['sector_counts'].items())),
             already_held,
             policy,
             primary_strategy_key,
@@ -837,6 +941,8 @@ with main_tab_discover:
                         llm_config=llm_cfg,
                         available_cash=cash_ledger['available_cash'],
                         already_held=already_held,
+                        open_portfolio_risk=cash_ledger['open_portfolio_risk'],
+                        sector_counts=cash_ledger['sector_counts'],
                     )
             except Exception as exc:
                 st.error(f"Unable to load real market history for '{ticker}': {exc}")
@@ -852,6 +958,6 @@ with main_tab_portfolio:
         starting_bankroll=bankroll,
         bars_by_ticker=known_bars_map,
     )
-    render_paper_portfolio_tab(portfolio_state)
+    render_paper_portfolio_tab(portfolio_state, policy)
 
 st.caption('Limitations: educational paper-research tool, daily OHLC stop approximation, no automated trade execution. Not investment advice.')

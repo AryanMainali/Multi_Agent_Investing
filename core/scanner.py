@@ -1,15 +1,13 @@
 """Two-stage S&P market scanner for autonomous stock discovery.
 
-Stage 1A (Wide Technical & Capital Scan):
+Stage 1A (Wide Technical, Capital, Heat & Sector Scan):
   Downloads real Yahoo Finance daily OHLCV bars in batches, filters out stocks that
-  cannot be sized to >= 1 whole share within the user's paper capital & RiskPolicy
-  (or breach volatility/liquidity limits), and ranks all eligible stocks by technical
-  and multi-strategy strength.
+  cannot be sized to >= 1 whole share within the user's paper capital, remaining
+  portfolio heat, and sector diversification caps, and ranks all eligible stocks.
 
-Stage 1B (Deep 6-Agent Pipeline on Top K):
-  Runs the full 6-agent suggestion workflow ([1. Market Data] + [2. Research AI] ->
-  [3. Strategy] -> [4. Risk Gate] -> [5. Report AI] / [Drop & Log] <- [6. Monitor Agent])
-  on the Top K shortlisted candidates.
+Stage 1B (Sector-Diversified Deep 6-Agent Pipeline on Top K):
+  Selects a sector-balanced Top K shortlist and runs the full 6-agent suggestion
+  workflow on each candidate.
 """
 from collections.abc import Callable
 from pathlib import Path
@@ -23,7 +21,7 @@ from core.data import REQUIRED, validate_bars
 from core.indicators import enrich
 from core.llm import LLMConfig
 from core.strategies import STRATEGIES
-from core.universe import get_universe_tickers
+from core.universe import get_known_sector, get_universe_tickers
 from core.workflow import run_suggestion_workflow
 
 
@@ -106,9 +104,11 @@ def scan_universe_technicals(
     min_volume_ratio: float = 0.30,
     available_cash: float | None = None,
     open_tickers: set[str] | None = None,
+    open_portfolio_risk: float = 0.0,
+    sector_counts: dict[str, int] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict:
-    """Batch-download OHLCV across tickers, filter by capital/risk eligibility, and rank."""
+    """Batch-download OHLCV across tickers, filter by capital/heat/sector eligibility, and rank."""
     if bankroll <= 0:
         raise ValueError('Bankroll must be positive')
     if not tickers:
@@ -116,8 +116,10 @@ def scan_universe_technicals(
 
     cash_budget = max(0.0, float(available_cash)) if available_cash is not None else float(bankroll)
     held_set = {t.upper() for t in (open_tickers or set())}
+    active_sectors = sector_counts or {}
     valid_data_count = 0
     affordable_count = 0
+    sector_blocked_count = 0
     eligible_rows = []
     total = len(tickers)
 
@@ -151,7 +153,13 @@ def scan_universe_technicals(
             tech = score_candidate_technicals(bars, primary_strategy=primary_strategy)
             mkt = tech['market']
             price = float(mkt['price'])
-            sized = size_position(price=price, cash=cash_budget, equity=bankroll, policy=policy)
+            sized = size_position(
+                price=price,
+                cash=cash_budget,
+                equity=bankroll,
+                policy=policy,
+                open_portfolio_risk=open_portfolio_risk,
+            )
             if sized['shares'] >= 1:
                 affordable_count += 1
             else:
@@ -159,6 +167,12 @@ def scan_universe_technicals(
 
             if sym.upper() in held_set:
                 continue
+
+            sec = get_known_sector(sym)
+            if sec != 'Unknown' and active_sectors.get(sec, 0) >= int(policy.max_positions_per_sector):
+                sector_blocked_count += 1
+                continue
+
             if mkt['volatility_20_pct'] > max_annual_volatility_pct:
                 continue
             if mkt['volume_ratio'] < min_volume_ratio:
@@ -168,6 +182,7 @@ def scan_universe_technicals(
 
             eligible_rows.append({
                 'Ticker': sym,
+                'Sector': sec,
                 'Scan Score': tech['scan_score'],
                 'Close ($)': price,
                 'Max Shares': sized['shares'],
@@ -185,7 +200,7 @@ def scan_universe_technicals(
 
     if not eligible_rows:
         leaderboard_df = pd.DataFrame(columns=[
-            'Ticker', 'Scan Score', 'Close ($)', 'Max Shares', 'Max Notional ($)',
+            'Ticker', 'Sector', 'Scan Score', 'Close ($)', 'Max Shares', 'Max Notional ($)',
             'Trend', 'Primary Stance', 'Strategy Consensus', '20d Momentum (%)',
             '20d Volatility (%)', 'Volume Ratio',
         ])
@@ -200,9 +215,46 @@ def scan_universe_technicals(
         'universe_size': total,
         'valid_data_count': valid_data_count,
         'affordable_count': affordable_count,
+        'sector_blocked_count': sector_blocked_count,
         'eligible_count': len(leaderboard_df),
         'leaderboard_df': leaderboard_df,
     }
+
+
+def _select_diversified_shortlist(
+    leaderboard_df: pd.DataFrame,
+    top_k: int,
+    max_per_sector: int,
+    open_sector_counts: dict[str, int],
+) -> list[dict]:
+    """Pick up to top_k candidates while respecting remaining per-sector slots."""
+    selected: list[dict] = []
+    shortlist_sector_counts: dict[str, int] = {}
+
+    for row in leaderboard_df.to_dict(orient='records'):
+        if len(selected) >= top_k:
+            break
+        sec = row.get('Sector', 'Unknown')
+        if sec != 'Unknown':
+            remaining_slots = max_per_sector - int(open_sector_counts.get(sec, 0))
+            if remaining_slots <= 0:
+                continue
+            if shortlist_sector_counts.get(sec, 0) >= remaining_slots:
+                continue
+            shortlist_sector_counts[sec] = shortlist_sector_counts.get(sec, 0) + 1
+        selected.append(row)
+
+    # If strict per-sector slots yielded fewer than top_k, backfill from remaining top rows
+    if len(selected) < top_k:
+        picked_syms = {r['Ticker'] for r in selected}
+        for row in leaderboard_df.to_dict(orient='records'):
+            if len(selected) >= top_k:
+                break
+            if row['Ticker'] not in picked_syms:
+                selected.append(row)
+                picked_syms.add(row['Ticker'])
+
+    return selected
 
 
 def scan_market_and_suggest(
@@ -218,14 +270,17 @@ def scan_market_and_suggest(
     log_to_db: bool = True,
     available_cash: float | None = None,
     open_tickers: set[str] | None = None,
+    open_portfolio_risk: float = 0.0,
+    sector_counts: dict[str, int] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict:
-    """End-to-end two-stage scanner: batch screen universe, then run 6-agent pipeline on Top K."""
+    """End-to-end two-stage scanner: batch screen universe, then run 6-agent pipeline on diversified Top K."""
     if top_k < 1:
         raise ValueError('top_k must be >= 1')
     active_policy = policy or RiskPolicy()
     tickers = tickers_override if tickers_override is not None else get_universe_tickers(scope=scope)
     held_set = {t.upper() for t in (open_tickers or set())}
+    active_sectors = dict(sector_counts or {})
 
     stage1 = scan_universe_technicals(
         tickers=tickers,
@@ -235,6 +290,8 @@ def scan_market_and_suggest(
         scan_period='6mo',
         available_cash=available_cash,
         open_tickers=held_set,
+        open_portfolio_risk=open_portfolio_risk,
+        sector_counts=active_sectors,
         progress_callback=progress_callback,
     )
 
@@ -250,7 +307,12 @@ def scan_market_and_suggest(
             'dropped_count': 0,
         }
 
-    top_rows = leaderboard_df.head(top_k).to_dict(orient='records')
+    top_rows = _select_diversified_shortlist(
+        leaderboard_df=leaderboard_df,
+        top_k=top_k,
+        max_per_sector=int(active_policy.max_positions_per_sector),
+        open_sector_counts=active_sectors,
+    )
     candidates = []
     for idx, row in enumerate(top_rows, start=1):
         sym = row['Ticker']
@@ -269,6 +331,8 @@ def scan_market_and_suggest(
                 log_to_db=log_to_db,
                 available_cash=available_cash,
                 already_held=(sym.upper() in held_set),
+                open_portfolio_risk=open_portfolio_risk,
+                sector_counts=active_sectors,
             )
             candidates.append({
                 'ticker': sym,
@@ -279,7 +343,6 @@ def scan_market_and_suggest(
         except Exception:
             continue
 
-    # Rank Risk-Gate PASSED candidates first by conviction & scan_score, then DROPPED candidates
     candidates.sort(
         key=lambda item: (
             1 if item['workflow']['risk']['passed'] else 0,
@@ -301,6 +364,7 @@ def scan_market_and_suggest(
             dropped_count += 1
         summary_records.append({
             'Ticker': c['ticker'],
+            'Sector': wf['risk']['sector'],
             'Risk Gate': 'PASSED' if passed else 'DROPPED',
             'Close ($)': wf['market']['price'],
             'Max Shares': wf['risk']['shares'],
