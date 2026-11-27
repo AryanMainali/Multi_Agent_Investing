@@ -1,27 +1,36 @@
-# System architecture and evaluation
+# System Architecture & Evaluation
 
-User onboarding (paper trading capital & risk tolerance) -> Ticker selection (Yahoo Finance real data) -> **Data Agent** (historical bars & indicators) -> **Market Agent** (state and volume) -> **Analyst Agent** (rule-based decision score) -> **Risk Manager** (hard constraints scaled to user risk profile) -> **Human checkpoint** (approve/reject paper suggestion) -> **SQLite audit**.
+## Non-Negotiable Core Rule
 
-The **Backtesting Engine** replays the analyst's well-defined 20/50 SMA crossover rule against *past only* bars. The dashboard shows its simulated results next to human-reviewed suggestions. The approval UI intentionally does not trigger or rewrite the backtest.
+**Agents only suggest. Humans decide and trade manually.**
+- No broker credentials, order endpoints, or automated execution exist in this repository.
+- Every passing idea terminates in a plain-English report for a human to review and either log a paper approval or skip.
 
-## Architecture mapping
+## Six-Agent Pipeline
 
-| Component | Agent architecture | Starter implementation | Later expansion |
-|---|---|---|---|
-| Market | Model-based reflex | Current/previous trend, crossover state, volume filter | Multi-ticker watchlist and persistent market state |
-| Data | Goal-based | Source selection + data validation + indicator computation | SEC financials, extra providers, data freshness planning |
-| Analyst | Utility-based with learning *planned* | Transparent heuristic score and SMA signals | Train/test probabilistic ranker; measure calibration |
-| Risk | Simple reflex/rule-based | Whole-share sizing, max allocation, risk budget, stop level | Portfolio caps, drawdown and daily stop rules |
+```text
+[1. Market Data] ──┐
+                   ├──► [3. Strategy] ──► [4. Risk Gate]
+[2. Research (AI)] ┘                         │
+                                     ┌───────┴───────┐
+                                   (No)            (Yes)
+                                     ▼               ▼
+                           [Drop & Log Reason]  [5. Report (AI)] ──► Human Decision
+                                                     ▲
+                                                     │ (checks every idea & agent)
+                                            [6. Monitor Agent]
+```
 
-The starter does **not** pretend to implement a trained agent. It provides separate architectural modules that are easy to explain and extend.
+| Stage | Module | Responsibility |
+|---|---|---|
+| 1. Market Data | `agents/data_agent.py`, `agents/market_agent.py` | Fetch & validate real Yahoo Finance daily OHLCV bars; compute past-only moving averages, momentum, volume ratio, and annualized volatility. |
+| 2. Research (AI) | `agents/research_agent.py`, `core/llm.py` | Gather recent Yahoo Finance headlines and company fundamentals; synthesize sentiment (`BULLISH` / `NEUTRAL` / `BEARISH`), catalysts, and risks via configured LLM or deterministic fallback. |
+| 3. Strategy | `agents/strategy_agent.py`, `core/strategies.py` | Combine Market Data and AI Research with active strategy signals (`SMA`, `EMA`, `MACD`, `RSI`, `Bollinger`, `Donchian`) into a scored candidate (`SUGGEST_LONG` or `AVOID_OR_WAIT`). |
+| 4. Risk Gate | `agents/risk_agent.py` | Deterministic hard caps on whole-share allocation, nominal stop-loss budget, annualized volatility ceiling, liquidity floor, and severe bearish headwinds. Never overridden by AI. |
+| Drop & Log | `core/storage.py` (`dropped_ideas`) | When Risk Gate returns `No`, drops the idea before report generation and logs exact rejection reasons to SQLite. |
+| 5. Report (AI) | `agents/report_agent.py` | When Risk Gate returns `Yes`, produces a plain-English suggestion brief detailing rationale, exact share cap, protective stop price, nominal risk, and risks. |
+| 6. Monitor Agent | `agents/monitor_agent.py`, `core/storage.py` (`workflow_audits`) | Audits every upstream stage for data staleness, cross-agent sentiment/signal divergence, mathematical risk invariants, and manual-only report compliance. |
 
-## Four-week plan
+## Academic Integrity of Backtests
 
-- Week 1: data model, offline reference dataset, risk constraints, interface contracts.
-- Week 2: agents, market signals, deterministic tests, multi-ticker exploration if time.
-- Week 3: Streamlit UI, SQLite audit, historical backtester and metrics.
-- Week 4: out-of-sample evaluation, integrated testing, report and demo.
-
-## Academic integrity of backtests
-
-Never feed a feature computed from future prices into historical decisions. Use the next day's opening price after a signal is known; keep training and evaluation periods separate if you add model fitting. A favorable return on a synthetic demo is **not evidence** of an investable edge. Compare risk-adjusted results, drawdown, trade frequency, and data handling. Do not add automatic trading to this class project.
+Signals are computed strictly from end-of-day bars through day `T` and simulated fills occur no earlier than day `T+1` open, incorporating estimated fees, slippage, whole-share constraints, and protective stops.

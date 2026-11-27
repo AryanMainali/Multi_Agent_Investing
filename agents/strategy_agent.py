@@ -1,0 +1,141 @@
+"""Stage 3 [Strategy]: Synthesizes [1. Market Data] and [2. Research (AI)] into a structured trade candidate."""
+from dataclasses import dataclass
+import pandas as pd
+from agents.analyst_agent import AnalystAgent
+from core.strategies import STRATEGIES, _compute_rsi, generate_signals
+
+ACTIVE_STRATEGY_KEYS = [k for k, spec in STRATEGIES.items() if spec.uses_risk_policy]
+
+
+def _evaluate_strategy_stance(prices: pd.DataFrame, key: str) -> dict:
+    df, spec = generate_signals(prices, strategy=key)
+    last = df.iloc[-1]
+    entry_now = bool(last['ENTRY_SIGNAL'])
+    exit_now = bool(last['EXIT_SIGNAL'])
+
+    if entry_now:
+        stance = 'BULLISH_SIGNAL'
+    elif exit_now:
+        stance = 'BEARISH_SIGNAL'
+    elif key == 'sma_crossover':
+        stance = 'BULLISH_TREND' if last['SMA_FAST'] > last['SMA_SLOW'] else 'BEARISH_TREND'
+    elif key == 'ema_crossover':
+        ema12 = prices['Close'].ewm(span=12, min_periods=12, adjust=False).mean().iloc[-1]
+        ema26 = prices['Close'].ewm(span=26, min_periods=26, adjust=False).mean().iloc[-1]
+        stance = 'BULLISH_TREND' if ema12 > ema26 else 'BEARISH_TREND'
+    elif key == 'macd_crossover':
+        ema12 = prices['Close'].ewm(span=12, min_periods=12, adjust=False).mean()
+        ema26 = prices['Close'].ewm(span=26, min_periods=26, adjust=False).mean()
+        macd = ema12 - ema26
+        sig = macd.ewm(span=9, min_periods=9, adjust=False).mean()
+        stance = 'BULLISH_TREND' if macd.iloc[-1] > sig.iloc[-1] else 'BEARISH_TREND'
+    elif key == 'rsi_mean_reversion':
+        rsi_val = float(_compute_rsi(prices['Close'], 14).iloc[-1])
+        if rsi_val < 40:
+            stance = 'BULLISH_OVERSOLD_ZONE'
+        elif rsi_val > 68:
+            stance = 'BEARISH_OVERBOUGHT_ZONE'
+        else:
+            stance = 'NEUTRAL'
+    elif key == 'bollinger_reversion':
+        mid = float(prices['Close'].rolling(20, min_periods=20).mean().iloc[-1])
+        stance = 'BULLISH_TREND' if float(last['Close']) >= mid else 'NEUTRAL_PULLBACK'
+    elif key == 'donchian_breakout':
+        mid_20 = float(prices['Close'].rolling(20, min_periods=20).mean().iloc[-1])
+        stance = 'BULLISH_TREND' if float(last['Close']) >= mid_20 else 'BEARISH_TREND'
+    else:
+        stance = 'NEUTRAL'
+
+    return {
+        'strategy_key': key,
+        'strategy_name': spec.name,
+        'entry_signal_today': entry_now,
+        'exit_signal_today': exit_now,
+        'stance': stance,
+        'bullish': stance.startswith('BULLISH'),
+    }
+
+
+@dataclass
+class StrategyAgent:
+    primary_strategy: str = 'sma_crossover'
+
+    def formulate(self, df: pd.DataFrame, market: dict, research: dict) -> dict:
+        key = self.primary_strategy if self.primary_strategy in ACTIVE_STRATEGY_KEYS else 'sma_crossover'
+        spec = STRATEGIES[key]
+        analyst = AnalystAgent().evaluate(df, market)
+
+        votes = {k: _evaluate_strategy_stance(df, k) for k in ACTIVE_STRATEGY_KEYS}
+        primary_vote = votes[key]
+        bullish_count = sum(1 for v in votes.values() if v['bullish'])
+
+        conviction = 0
+        rationale = []
+
+        # 1. Primary strategy stance & fresh signal
+        if primary_vote['entry_signal_today']:
+            conviction += 2
+            rationale.append(f"{spec.name} triggered a fresh entry signal on latest close ({spec.entry_reason}).")
+        elif primary_vote['exit_signal_today']:
+            conviction -= 2
+            rationale.append(f"{spec.name} triggered an exit signal on latest close ({spec.exit_reason}).")
+        elif primary_vote['bullish']:
+            conviction += 1
+            rationale.append(f"{spec.name} remains in a constructive bullish regime ({primary_vote['stance']}).")
+        else:
+            conviction -= 1
+            rationale.append(f"{spec.name} is currently in a non-bullish / defensive posture ({primary_vote['stance']}).")
+
+        # 2. Broad market/analyst technical score
+        h_score = int(analyst['heuristic_score'])
+        if h_score >= 2:
+            conviction += 1
+            rationale.append(f"Technical screening score is supportive ({h_score:+d}; trend={market['trend']}).")
+        elif h_score <= -2:
+            conviction -= 1
+            rationale.append(f"Technical screening score is weak ({h_score:+d}; trend={market['trend']}).")
+
+        # 3. Multi-strategy agreement across the 6 active strategies
+        if bullish_count >= 4:
+            conviction += 1
+            rationale.append(f"{bullish_count}/{len(ACTIVE_STRATEGY_KEYS)} active strategies align constructively.")
+        elif bullish_count <= 1:
+            conviction -= 1
+            rationale.append(f"Only {bullish_count}/{len(ACTIVE_STRATEGY_KEYS)} active strategies show bullish posture.")
+
+        # 4. AI Research sentiment contribution
+        sentiment = str(research.get('sentiment', 'NEUTRAL')).upper()
+        if sentiment == 'BULLISH':
+            conviction += 1
+            rationale.append(f"Research (AI) sentiment is BULLISH ({research.get('sentiment_score', 0):+.2f}).")
+        elif sentiment == 'BEARISH':
+            conviction -= 1
+            rationale.append(f"Research (AI) sentiment is BEARISH ({research.get('sentiment_score', 0):+.2f}).")
+        else:
+            rationale.append('Research (AI) sentiment is NEUTRAL; technicals carry primary weight.')
+
+        conviction = max(-5, min(5, conviction))
+        if conviction >= 1 and not primary_vote['exit_signal_today']:
+            action = 'SUGGEST_LONG'
+            direction = 'LONG'
+            summary = f"Constructive paper long candidate via {spec.name} (conviction {conviction:+d}/5)."
+        else:
+            action = 'AVOID_OR_WAIT'
+            direction = 'FLAT'
+            summary = f"No long suggestion — conditions favor staying flat / waiting (conviction {conviction:+d}/5)."
+
+        return {
+            'strategy_key': key,
+            'strategy_name': spec.name,
+            'strategy_category': spec.category,
+            'direction': direction,
+            'action': action,
+            'conviction_score': conviction,
+            'entry_reference_price': analyst['price'],
+            'analyst_screening': analyst,
+            'bullish_strategies_count': bullish_count,
+            'total_active_strategies': len(ACTIVE_STRATEGY_KEYS),
+            'strategy_votes': votes,
+            'rationale': rationale,
+            'summary': summary,
+        }
