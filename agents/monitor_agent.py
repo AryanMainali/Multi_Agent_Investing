@@ -1,14 +1,32 @@
-"""Stage 6 [Monitor Agent]: Independent auditor checking every idea and every agent.
+"""Stage 6 [Monitor Agent]: Independent auditor, heartbeat watcher, and retrospective idea scorer.
 
-Inspects [1. Market Data], [2. Research (AI)], [3. Strategy], [4. Risk Gate],
-and [5. Report (AI)] for data freshness, cross-agent consistency, risk invariants,
-and strict adherence to manual-only human decision rules.
+1. Per-Idea Audit: Inspects [1. Market Data], [2. Research (AI)], [3. Strategy],
+   [4. Risk Gate], and [5. Report (AI)] for data freshness, cross-agent consistency,
+   mathematical risk invariants, and strict manual-only report compliance.
+2. Agent Heartbeats: Verifies all upstream agents ran recently without errors.
+3. Retrospective Scorecard: Once an idea's N-day horizon passes, scores BOTH
+   Risk-Approved and Risk-Rejected proposals so the team can verify whether the
+   system has a >50% edge and whether Risk is filtering effectively.
+4. Daily Summary & Optional Alerts: Writes daily markdown summaries and sends
+   optional Telegram notifications when configured in .env.
 """
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 import numpy as np
 import pandas as pd
+import requests
 from agents.risk_agent import RiskPolicy
+from core.config import EnvConfig, REPORTS_DIR, load_env, load_settings
+from core.llm import LLMConfig, generate_text
+import core.storage as storage_mod
+from core.storage import (
+    get_idea_scorecard,
+    list_heartbeats,
+    list_proposals,
+    record_heartbeat,
+    score_past_proposals,
+)
 
 FORBIDDEN_EXECUTION_PHRASES = (
     'order submitted',
@@ -17,6 +35,59 @@ FORBIDDEN_EXECUTION_PHRASES = (
     'trade has been placed',
     'guaranteed profit',
 )
+
+WATCHED_AGENTS = ('market_data', 'research', 'strategy', 'risk', 'report')
+
+
+def send_telegram_alert(text: str, env: EnvConfig | None = None) -> bool:
+    """Send an optional read-only health/advisory alert via Telegram bot if configured in .env."""
+    active_env = env or load_env()
+    if not active_env.telegram_enabled:
+        return False
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{active_env.telegram_token}/sendMessage",
+            json={'chat_id': active_env.telegram_chat_id, 'text': text[:4000]},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def check_agent_heartbeats(
+    stale_after_hours: int | None = None,
+    db_path: Path | None = None,
+    now_utc: datetime | None = None,
+) -> list[str]:
+    """Check that all 5 upstream pipeline stages ran recently without error."""
+    settings = load_settings()
+    max_hours = int(stale_after_hours if stale_after_hours is not None else settings.get('monitor', {}).get('stale_after_hours', 30))
+    now = now_utc or datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=max_hours)
+
+    beats = {row['agent']: row for row in list_heartbeats(db_path=db_path)}
+    issues: list[str] = []
+
+    for agent_name in WATCHED_AGENTS:
+        b = beats.get(agent_name)
+        if b is None:
+            issues.append(f"{agent_name} has never recorded a run")
+            continue
+        if b['status'] != 'ok':
+            issues.append(f"{agent_name} last run failed: {b['detail'][:200]}")
+            continue
+        try:
+            last_dt = datetime.fromisoformat(str(b['last_run_utc']))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            if last_dt < cutoff:
+                issues.append(f"{agent_name} has not run since {last_dt:%Y-%m-%d %H:%M} UTC")
+        except ValueError:
+            issues.append(f"{agent_name} has an invalid heartbeat timestamp")
+
+    return issues
 
 
 @dataclass
@@ -60,14 +131,18 @@ class MonitorAgent:
         valid_sentiment = research.get('sentiment') in ('BULLISH', 'NEUTRAL', 'BEARISH')
         has_summary = bool(str(research.get('summary', '')).strip())
         headlines_count = len(research.get('headlines', []))
+        high_flags = research.get('high_severity_flags') or []
         if not (valid_sentiment and has_summary):
             critical_errors.append('Research Agent output missing valid sentiment or summary.')
         if headlines_count == 0:
             warnings.append('Research Agent received 0 recent headlines from Yahoo Finance; relied on price & fundamentals.')
+        if high_flags and risk_gate.get('passed'):
+            critical_errors.append('High-severity adverse news flag was present on an approved idea.')
         agent_checks['2_research_ai'] = {
             'status': 'CRITICAL' if not (valid_sentiment and has_summary) else ('WARN' if headlines_count == 0 else 'OK'),
             'sentiment': research.get('sentiment'),
             'headlines_reviewed': headlines_count,
+            'event_flags_count': len(research.get('event_flags') or []),
             'ai_mode': research.get('ai_mode'),
         }
 
@@ -169,4 +244,83 @@ class MonitorAgent:
             'agent_checks': agent_checks,
             'warnings': warnings,
             'critical_errors': critical_errors,
+        }
+
+    def run_health_and_scorecard(
+        self,
+        bars_by_ticker: dict[str, pd.DataFrame] | None = None,
+        db_path: Path | None = None,
+        llm_config: LLMConfig | None = None,
+        output_dir: Path | None = None,
+        send_alerts: bool = False,
+    ) -> dict:
+        """Score past ideas (approved & rejected), check agent heartbeats, and write daily summary."""
+        target_db = Path(db_path) if db_path is not None else storage_mod.DEFAULT_DB
+        issues = check_agent_heartbeats(db_path=target_db)
+        newly_scored = score_past_proposals(bars_by_ticker or {}, db_path=target_db)
+        card_df = get_idea_scorecard(db_path=target_db)
+        proposals_list = list_proposals(db_path=target_db)
+
+        status_counts: dict[str, int] = {}
+        for p in proposals_list:
+            st_key = str(p['status'])
+            status_counts[st_key] = status_counts.get(st_key, 0) + 1
+
+        health_md = '\n'.join(f"- {i}" for i in issues) if issues else '- All upstream agents healthy'
+        counts_md = (
+            '\n'.join(f"- **{k}**: {v}" for k, v in sorted(status_counts.items()))
+            if status_counts
+            else '- None recorded yet'
+        )
+        card_md = (
+            f"```\n{card_df.to_string(index=False)}\n```"
+            if not card_df.empty
+            else 'No proposals have reached their forward evaluation horizon yet.'
+        )
+
+        facts_md = (
+            f"## Agent Heartbeat Health\n{health_md}\n\n"
+            f"## Proposals by Risk Gate Status\n{counts_md}\n\n"
+            f"## Retrospective Scorecard (Settled Horizon Ideas)\n{card_md}\n"
+        )
+
+        llm_summary, _ = generate_text(
+            system_prompt=(
+                'Summarize this trading-research system status for a non-expert team in 4 short bullet points. '
+                'Use only the facts given. Be candid if the hit rate is near 50% (no edge yet). '
+                'Never suggest automated trading.'
+            ),
+            user_prompt=facts_md,
+            config=llm_config,
+            max_tokens=350,
+        )
+
+        daily_dir = output_dir or (target_db.parent / 'reports' / 'daily' if db_path else REPORTS_DIR / 'daily')
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = daily_dir / f"summary_{date.today().isoformat()}.md"
+        full_md = (
+            f"# Daily Monitor Summary ({date.today().isoformat()})\n\n"
+            + (f"{llm_summary}\n\n" if llm_summary else '')
+            + facts_md
+            + '\n_Agents only suggest. Humans decide and trade manually._\n'
+        )
+        summary_path.write_text(full_md, encoding='utf-8')
+
+        record_heartbeat(
+            'monitor',
+            status='ok',
+            detail=f"scored {newly_scored} proposals; {len(issues)} health issue(s)",
+            db_path=target_db,
+        )
+
+        if send_alerts and issues:
+            send_telegram_alert('Trading research agents need attention:\n' + health_md)
+
+        return {
+            'issues': issues,
+            'newly_scored': newly_scored,
+            'scorecard_df': card_df,
+            'proposal_counts': status_counts,
+            'summary_markdown': full_md,
+            'summary_path': str(summary_path),
         }

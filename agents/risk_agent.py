@@ -1,11 +1,14 @@
-"""Stage 4 [Risk Gate]: Deterministic hard numerical caps and pass/drop gate.
+"""Stage 4 [Risk Gate]: Deterministic hard numerical caps, news/freshness blocks, and pass/drop gate.
 
-Enforces both single-position caps (allocation, per-trade nominal risk, stop-loss)
-and portfolio-level caps (total open portfolio heat and max positions per sector).
-Risk limits are never overridden by AI models.
+Enforces single-position caps (allocation, per-trade nominal risk, stop-loss),
+portfolio-level caps (total open portfolio heat and max positions per sector),
+and rule-based safety blocks (high-severity adverse news events, stale/missing bars,
+and optional ML confidence/accuracy floors). Never overridden by AI models.
 """
 from dataclasses import dataclass
+from datetime import date
 from math import floor
+from core.config import load_settings
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,48 @@ def get_risk_policy(level: str = 'medium') -> RiskPolicy:
     return RISK_PROFILES[key]
 
 
+def evaluate_proposal_rules(proposal: dict, ctx: dict, cfg: dict | None = None) -> tuple[bool, list[str], float]:
+    """Pure deterministic proposal rule evaluator (from team Risk agent design).
+
+    ctx keys: today (date), last_bar_day (date|None), high_flags (list[str]), approved_today (int)
+    Returns (approved, reasons, suggested_max_pct).
+    """
+    active_cfg = cfg or load_settings().get('risk', {})
+    reasons: list[str] = []
+
+    prob = float(proposal.get('probability', 0.0))
+    acc = float(proposal.get('backtest_accuracy', 0.0))
+    min_conf = float(active_cfg.get('min_confidence', 0.53))
+    min_acc = float(active_cfg.get('min_backtest_accuracy', 0.51))
+
+    if prob < min_conf:
+        reasons.append(f"confidence {prob:.2f} below {min_conf}")
+    if acc < min_acc:
+        reasons.append(f"backtest accuracy {acc:.2f} below {min_acc}")
+
+    last_day = ctx.get('last_bar_day')
+    if last_day is None:
+        reasons.append('no price data')
+    elif (ctx['today'] - last_day).days > int(active_cfg.get('max_data_age_days', 5)):
+        reasons.append(f"price data is stale (latest {last_day})")
+
+    if ctx.get('high_flags'):
+        reasons.append('high-severity news: ' + '; '.join(ctx['high_flags'][:3]))
+
+    max_ideas = int(active_cfg.get('max_ideas_per_day', 10))
+    if int(ctx.get('approved_today', 0)) >= max_ideas:
+        reasons.append(f"daily limit of {max_ideas} ideas reached")
+
+    approved = not reasons
+    kelly_frac = float(active_cfg.get('kelly_fraction', 0.25))
+    max_pos_pct = float(active_cfg.get('max_position_pct', 20.0))
+    kelly_pct = max(0.0, 2.0 * prob - 1.0) * kelly_frac * 100.0
+    size_pct = round(min(kelly_pct, max_pos_pct), 2) if approved else 0.0
+    if approved:
+        reasons.append('passed all checks')
+    return approved, reasons, size_pct
+
+
 def size_position(
     price: float,
     cash: float,
@@ -125,8 +170,11 @@ def evaluate_risk_gate(
     open_portfolio_risk: float = 0.0,
     sector_counts: dict[str, int] | None = None,
     candidate_sector: str | None = None,
+    reference_date: date | None = None,
+    max_data_age_days: int | None = None,
 ) -> dict:
     """Deterministic Yes/No gate deciding whether a Strategy idea reaches Report (AI) or gets Dropped."""
+    risk_cfg = load_settings().get('risk', {})
     price = float(strategy_idea['entry_reference_price'])
     cash_budget = max(0.0, float(available_cash)) if available_cash is not None else float(bankroll)
     sized = size_position(
@@ -159,6 +207,19 @@ def evaluate_risk_gate(
         drop_reasons.append(
             f"Strategy did not produce an actionable long setup ({action_detail}; {strategy_idea.get('summary', 'unfavorable conditions')})."
         )
+
+    # Check 1B (when ML strategy is primary): require minimum walk-forward confidence & held-out accuracy
+    ml_forecast = strategy_idea.get('ml_forecast')
+    if strategy_idea.get('strategy_key') == 'ml_logistic_walkforward' and isinstance(ml_forecast, dict):
+        min_conf = float(risk_cfg.get('min_confidence', 0.53))
+        min_acc = float(risk_cfg.get('min_backtest_accuracy', 0.51))
+        p_up = float(ml_forecast.get('p_up', 0.5))
+        acc = float(ml_forecast.get('backtest_accuracy', 0.5))
+        ml_ok = p_up >= min_conf and acc >= min_acc
+        ml_detail = f"ML P(up)={p_up:.2f} (min {min_conf:.2f}), held-out acc={acc:.2f} (min {min_acc:.2f})"
+        checks.append({'check': 'ML confidence & backtest accuracy', 'passed': ml_ok, 'detail': ml_detail})
+        if not ml_ok:
+            drop_reasons.append(f"ML walk-forward check failed ({ml_detail}).")
 
     # Check 2: Portfolio heat budget check
     max_heat_dollars = bankroll * policy.max_portfolio_heat
@@ -221,7 +282,15 @@ def evaluate_risk_gate(
     if not liq_ok:
         drop_reasons.append(f"Relative volume ({vol_ratio:.2f}x 20-day average) is below liquidity floor ({min_volume_ratio:.2f}x).")
 
-    # Check 7: Severe bearish research headwind check
+    # Check 7: High-severity adverse news event block (from team Risk & Research design)
+    high_flags = list(research.get('high_severity_flags') or [])
+    news_flags_ok = len(high_flags) == 0
+    news_detail = 'No high-severity adverse news flagged' if news_flags_ok else '; '.join(high_flags[:2])
+    checks.append({'check': 'High-severity news block', 'passed': news_flags_ok, 'detail': news_detail})
+    if not news_flags_ok:
+        drop_reasons.append(f"High-severity adverse news event flagged: {'; '.join(high_flags[:3])}")
+
+    # Check 8: Severe bearish research headwind check
     sentiment = str(research.get('sentiment', 'NEUTRAL')).upper()
     sent_score = float(research.get('sentiment_score', 0.0))
     conviction = int(strategy_idea.get('conviction_score', 0))
@@ -233,16 +302,36 @@ def evaluate_risk_gate(
             f"Strong bearish research sentiment ({sent_score:+.2f}) conflicts with moderate technical conviction ({conviction})."
         )
 
+    # Check 9 (when reference_date supplied): Price bar freshness check
+    if reference_date is not None and market.get('as_of'):
+        max_age = int(max_data_age_days if max_data_age_days is not None else risk_cfg.get('max_data_age_days', 5))
+        try:
+            bar_dt = date.fromisoformat(str(market['as_of'])[:10])
+            age_days = (reference_date - bar_dt).days
+            fresh_ok = age_days <= max_age
+            fresh_detail = f"Latest bar {bar_dt} ({age_days}d old; max {max_age}d)"
+            checks.append({'check': 'Price data freshness', 'passed': fresh_ok, 'detail': fresh_detail})
+            if not fresh_ok:
+                drop_reasons.append(f"Price data is stale (latest bar {bar_dt} is {age_days} days old, max {max_age}).")
+        except ValueError:
+            pass
+
     passed = len(drop_reasons) == 0
     stop_price = sized['stop_price']
     target_price = round(price * (1 + 2.0 * policy.stop_loss_fraction), 2)
     risk_per_share = max(price - stop_price, 1e-6)
     reward_risk_ratio = round((target_price - price) / risk_per_share, 2)
 
+    # Informational quarter-Kelly sizing reference alongside hard stop-risk share sizing
+    kelly_frac = float(risk_cfg.get('kelly_fraction', 0.25))
+    p_est = float(ml_forecast['p_up']) if isinstance(ml_forecast, dict) else 0.55
+    kelly_pct = round(min(max(0.0, 2.0 * p_est - 1.0) * kelly_frac * 100.0, policy.max_allocation * 100.0), 2)
+
     return {
         **sized,
         'sector': sector,
         'sector_open_count': curr_sector_count,
+        'kelly_reference_pct': kelly_pct,
         'passed': passed,
         'decision': 'PASS_TO_REPORT' if passed else 'DROP_AND_LOG',
         'target_price': target_price,

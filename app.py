@@ -7,14 +7,21 @@ import pandas as pd
 import streamlit as st
 from agents.risk_agent import RiskPolicy, get_risk_policy
 from core.backtest import compare_strategies
+from core.exports import (
+    build_portfolio_report_markdown,
+    build_suggestion_report_markdown,
+    dataframe_to_csv_bytes,
+)
 from core.llm import LLMConfig
 from core.portfolio import evaluate_paper_portfolio, get_paper_cash_summary
 from core.scanner import scan_market_and_suggest
 from core.storage import (
     clear_paper_positions,
     close_paper_position,
+    get_idea_scorecard,
     list_decisions,
     list_dropped_ideas,
+    list_heartbeats,
     list_workflow_audits,
     open_paper_position,
     save_decision,
@@ -136,8 +143,11 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
             st.markdown('**Key Risks**')
             for r_item in res['risks']:
                 st.markdown(f"- {r_item}")
+        if res.get('event_flags'):
+            st.markdown('**Structured News Event Flags (Severity & Category)**')
+            st.dataframe(pd.DataFrame(res['event_flags']), width='stretch', hide_index=True)
         if res['headlines']:
-            st.markdown('**Recent Yahoo Finance Headlines**')
+            st.markdown('**Recent Market Headlines**')
             st.dataframe(pd.DataFrame(res['headlines']), width='stretch', hide_index=True)
         if res['fundamentals']:
             with st.expander('Company fundamentals snapshot'):
@@ -149,6 +159,21 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
             f"**Selected Strategy:** {strat['strategy_name']} "
             f"(`{strat['action']}`, conviction `{strat['conviction_score']:+d}/5`)"
         )
+        ml_f = strat.get('ml_forecast')
+        if isinstance(ml_f, dict) and ml_f.get('available'):
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric(
+                f"Walk-Forward {ml_f['horizon_days']}d ML P(Up)",
+                f"{ml_f['p_up']:.1%}",
+                ml_f['direction'].upper(),
+            )
+            mc2.metric(
+                'Held-Out Backtest Accuracy',
+                f"{ml_f['backtest_accuracy']:.1%}",
+                f"Last {ml_f['test_window']} settled bars (with embargo)",
+                delta_color='off',
+            )
+            mc3.metric('Training Sample Rows', str(ml_f['train_samples']))
         for bullet in strat['rationale']:
             st.markdown(f"- {bullet}")
         votes_df = pd.DataFrame(list(strat['strategy_votes'].values()))
@@ -172,6 +197,21 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
                 st.error(f"Critical alert: {err}")
         checks_rows = [{'Stage': stage, **details} for stage, details in mon['agent_checks'].items()]
         st.dataframe(pd.DataFrame(checks_rows), width='stretch', hide_index=True)
+
+        beats = list_heartbeats()
+        if beats:
+            st.markdown('**Agent Pipeline Heartbeats**')
+            st.dataframe(pd.DataFrame(beats), width='stretch', hide_index=True)
+
+        scorecard_df = get_idea_scorecard()
+        st.markdown('**Retrospective Idea Scorecard (Approved vs. Risk-Rejected After Horizon Passes)**')
+        if not scorecard_df.empty:
+            st.dataframe(scorecard_df, width='stretch', hide_index=True)
+        else:
+            st.caption(
+                'Proposals (both Approved and Risk-Rejected) are automatically scored once their forward '
+                'horizon (default 5 trading days) passes so you can compare hit rates against a 50% coin flip.'
+            )
 
     st.divider()
     st.subheader(f"2. Multi-strategy historical backtest — {result['ticker']}")
@@ -201,6 +241,7 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
 
     if not selected_names:
         st.warning('Select at least one strategy above to run historical backtests.')
+        summary_df_for_export = None
     else:
         selected_keys = [NAME_TO_STRATEGY_KEY[name] for name in selected_names]
         summary_df, equity_df, results_by_key = compare_strategies(
@@ -209,6 +250,7 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
             policy=policy,
             strategy_keys=selected_keys,
         )
+        summary_df_for_export = summary_df
 
         best_return_row = summary_df.iloc[0]
         best_sharpe_row = summary_df.loc[summary_df['Sharpe'].idxmax()]
@@ -246,6 +288,25 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
             },
         )
 
+        exp_c1, exp_c2 = st.columns(2)
+        dossier_md = build_suggestion_report_markdown(result, summary_df_for_export, bankroll, policy)
+        exp_c1.download_button(
+            f"Download {result['ticker']} Suggestion Dossier (.md)",
+            data=dossier_md.encode('utf-8'),
+            file_name=f"{result['ticker']}_suggestion_dossier_{result['as_of']}.md",
+            mime='text/markdown',
+            key=f"dl_dossier_{result['ticker']}",
+            width='stretch',
+        )
+        exp_c2.download_button(
+            f"Download {result['ticker']} Strategy Comparison (.csv)",
+            data=dataframe_to_csv_bytes(summary_df),
+            file_name=f"{result['ticker']}_strategy_comparison_{result['as_of']}.csv",
+            mime='text/csv',
+            key=f"dl_bt_summary_{result['ticker']}",
+            width='stretch',
+        )
+
         st.markdown('**Portfolio equity curves ($)**')
         st.line_chart(equity_df)
 
@@ -273,6 +334,13 @@ def render_candidate_deep_dive(data: pd.DataFrame, result: dict, bankroll: float
                 st.info('No trades triggered for this strategy in this historical window.')
             else:
                 st.dataframe(bt.trades, width='stretch', hide_index=True)
+                st.download_button(
+                    f"Download {inspect_spec.name} Trade Log (.csv)",
+                    data=dataframe_to_csv_bytes(bt.trades),
+                    file_name=f"{result['ticker']}_{inspect_key}_trades.csv",
+                    mime='text/csv',
+                    key=f"dl_trades_{result['ticker']}_{inspect_key}",
+                )
 
     st.divider()
     st.subheader('3. Human decision & paper position entry')
@@ -416,6 +484,65 @@ def render_paper_portfolio_tab(portfolio: dict, policy: RiskPolicy) -> None:
     )
     p4.metric('Unrealized P&L (Open)', f"${portfolio['unrealized_pnl']:+,.2f}")
     p5.metric('Realized P&L (Closed)', f"${portfolio['realized_pnl']:+,.2f}")
+
+    # --- SPY Benchmark Comparison & Export Row ---
+    bench = portfolio.get('spy_benchmark', {})
+    st.markdown('### Performance vs. SPY Benchmark')
+    if bench.get('available'):
+        b1, b2, b3 = st.columns(3)
+        b1.metric(
+            'Your Paper Portfolio Return',
+            f"{portfolio['total_return_pct']:+.2f}%",
+            f"${portfolio['total_equity']:,.2f} current equity",
+        )
+        b2.metric(
+            f"SPY Return (Since {bench['inception_date']})",
+            f"{bench['spy_return_pct']:+.2f}%",
+            f"${bench['spy_ending_equity']:,.2f} equivalent",
+        )
+        b3.metric(
+            'Excess Return (Alpha vs. SPY)',
+            f"{bench['alpha_vs_spy_pct']:+.2f}%",
+            'Outperforming SPY' if bench['alpha_vs_spy_pct'] >= 0 else 'Trailing SPY',
+        )
+        if len(bench['curve_df']) >= 2:
+            st.line_chart(bench['curve_df'])
+        else:
+            st.caption(
+                f"Inception began on the latest trading session ({bench['inception_date']}). "
+                'Multi-day equity curves vs. SPY will plot automatically as new daily bars close.'
+            )
+    else:
+        st.caption('Open your first paper position to start tracking your live paper equity curve against SPY.')
+
+    port_report_md = build_portfolio_report_markdown(portfolio, policy)
+    dl_col1, dl_col2, dl_col3 = st.columns(3)
+    dl_col1.download_button(
+        'Download Portfolio & SPY Report (.md)',
+        data=port_report_md.encode('utf-8'),
+        file_name='paper_portfolio_report.md',
+        mime='text/markdown',
+        key='dl_port_md',
+        width='stretch',
+    )
+    if portfolio['open_positions']:
+        dl_col2.download_button(
+            'Download Open Positions (.csv)',
+            data=dataframe_to_csv_bytes(pd.DataFrame(portfolio['open_positions'])),
+            file_name='open_paper_positions.csv',
+            mime='text/csv',
+            key='dl_open_pos_csv',
+            width='stretch',
+        )
+    if portfolio['closed_positions']:
+        dl_col3.download_button(
+            'Download Closed Trades (.csv)',
+            data=dataframe_to_csv_bytes(pd.DataFrame(portfolio['closed_positions'])),
+            file_name='closed_paper_positions.csv',
+            mime='text/csv',
+            key='dl_closed_pos_csv',
+            width='stretch',
+        )
 
     if portfolio['alerts']:
         st.markdown('**Advisory Position Alerts (Manual Review Suggested)**')
@@ -891,6 +1018,13 @@ with main_tab_discover:
 
             with st.expander(f"View wider {scope_title} technical scan leaderboard (Top 25 eligible stocks)"):
                 st.dataframe(scan_res['leaderboard_df'].head(25), width='stretch', hide_index=True)
+                st.download_button(
+                    f"Download {scope_title} Scan Leaderboard (.csv)",
+                    data=dataframe_to_csv_bytes(scan_res['leaderboard_df']),
+                    file_name=f"{scan_res['scope']}_scan_leaderboard.csv",
+                    mime='text/csv',
+                    key='dl_scan_leaderboard_csv',
+                )
 
             candidate_options = [
                 f"{c['ticker']} ({c['workflow']['risk']['sector']}) — "

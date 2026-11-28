@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from core.indicators import enrich
+from core.ml_model import generate_walk_forward_signal_series
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,17 @@ STRATEGIES: dict[str, StrategySpec] = {
         description='Buy when close breaks above prior 20-day high; exit when close breaks below prior 10-day low.',
         entry_reason='20-day high breakout',
         exit_reason='10-day low breakdown',
+    ),
+    'ml_logistic_walkforward': StrategySpec(
+        key='ml_logistic_walkforward',
+        name='ML Walk-Forward Logistic (5d)',
+        category='Machine Learning',
+        description=(
+            'Standardized L2 Logistic Regression trained strictly on past settled 5-day outcomes '
+            '(with 5-day embargo); enters when P(up) >= 54% and exits when P(up) < 46%.'
+        ),
+        entry_reason='Walk-forward ML P(5d up) >= 54%',
+        exit_reason='Walk-forward ML P(5d up) < 46%',
     ),
     'buy_and_hold': StrategySpec(
         key='buy_and_hold',
@@ -154,6 +166,14 @@ def generate_signals(
         prior_low_10 = x['Low'].shift(1).rolling(10, min_periods=10).min()
         x['ENTRY_SIGNAL'] = ((close > prior_high_20) & prior_high_20.notna()).astype(bool)
         x['EXIT_SIGNAL'] = ((close < prior_low_10) & prior_low_10.notna()).astype(bool)
+
+    elif strategy == 'ml_logistic_walkforward':
+        p_up = generate_walk_forward_signal_series(x, horizon_days=5)
+        x['ML_P_UP'] = p_up
+        bull = p_up >= 0.54
+        prior_bull = bull.shift(1, fill_value=False)
+        x['ENTRY_SIGNAL'] = (bull & ~prior_bull & p_up.notna()).astype(bool)
+        x['EXIT_SIGNAL'] = ((p_up < 0.46) & p_up.notna()).astype(bool)
 
     elif strategy == 'buy_and_hold':
         entry = pd.Series(False, index=x.index)

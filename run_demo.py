@@ -1,16 +1,29 @@
-"""Run real-data CLI S&P market scanner (or manual ticker lookup), 6-agent workflow, and backtests.
+"""Run real-data CLI S&P market scanner (or watchlist / manual ticker), 6-agent workflow,
+retrospective Monitor scorecard, or post-close weekday scheduler.
 
 Core Design Rule: Agents only suggest. Humans decide and trade manually.
 Does NOT connect to any broker or submit any trading orders.
 """
 import argparse
+from datetime import datetime
+from pathlib import Path
 import sys
+import time
+from zoneinfo import ZoneInfo
+
+from agents.monitor_agent import MonitorAgent
 from agents.risk_agent import get_risk_policy
 from core.backtest import compare_strategies
+from core.config import get_logger, load_settings
+from core.data import load_history
+from core.exports import build_suggestion_report_markdown
 from core.portfolio import evaluate_paper_portfolio
 from core.scanner import scan_market_and_suggest
+from core.storage import list_proposals
 from core.strategies import STRATEGIES
 from core.workflow import run_suggestion_workflow
+
+log = get_logger('runner')
 
 
 def prompt_startup_settings(bankroll: float | None, risk: str | None) -> tuple[float, str]:
@@ -30,19 +43,23 @@ def prompt_startup_settings(bankroll: float | None, risk: str | None) -> tuple[f
     return bankroll, risk
 
 
-def main():
-    active_keys = [k for k, spec in STRATEGIES.items() if spec.uses_risk_policy]
-    strategy_choices = ['all'] + list(STRATEGIES.keys())
-    parser = argparse.ArgumentParser(description='S&P market scanner & 6-agent stock suggestion workflow (manual human decisions only)')
-    parser.add_argument('--scan', choices=['sp100', 'sp500'], default='sp100', help='Market scan universe when --ticker is omitted (default: sp100)')
-    parser.add_argument('--top-k', type=int, default=5, help='Number of top candidates to run through the 6-agent pipeline (default: 5)')
-    parser.add_argument('--ticker', default=None, help='Optional manual stock ticker override (skips market scan if provided)')
-    parser.add_argument('--bankroll', type=float, default=None, help='Starting paper trading capital ($)')
-    parser.add_argument('--risk', choices=['low', 'medium', 'high'], default=None, help='Risk tolerance level')
-    parser.add_argument('--period', default='2y', help='Yahoo Finance history window (e.g. 6mo, 1y, 2y, 5y)')
-    parser.add_argument('--strategy', choices=strategy_choices, default='all', help='Strategy key for backtest comparison, or all')
-    args = parser.parse_args()
+def run_monitor_mode() -> None:
+    """Check agent heartbeats, score past proposals whose horizon elapsed, and write daily summary."""
+    proposals = list_proposals()
+    symbols = sorted({p['symbol'] for p in proposals})
+    bars_map = {}
+    for sym in symbols:
+        try:
+            bars_map[sym] = load_history(ticker=sym, period='1y', source='yahoo')
+        except Exception:
+            continue
+    report = MonitorAgent().run_health_and_scorecard(bars_by_ticker=bars_map, send_alerts=True)
+    print(report['summary_markdown'])
+    print(f"Saved daily monitor summary to: {report['summary_path']}")
 
+
+def run_once(args) -> None:
+    active_keys = [k for k, spec in STRATEGIES.items() if spec.uses_risk_policy]
     bankroll, risk_level = prompt_startup_settings(args.bankroll, args.risk)
     policy = get_risk_policy(risk_level)
     primary_strategy = args.strategy if args.strategy in active_keys else 'sma_crossover'
@@ -78,7 +95,13 @@ def main():
             sector_counts=portfolio['sector_counts'],
         )
     else:
-        print(f"\nScanning {args.scan.upper()} universe for top {args.top_k} sector-diversified candidates...")
+        override_syms = None
+        if args.mode == 'watchlist':
+            override_syms = [str(s).upper() for s in load_settings().get('watchlist', ['AAPL', 'MSFT', 'NVDA', 'JPM', 'SPY'])]
+            print(f"\nScanning config/settings.yaml watchlist {override_syms}...")
+        else:
+            print(f"\nScanning {args.scan.upper()} universe for top {args.top_k} sector-diversified candidates...")
+
         scan_res = scan_market_and_suggest(
             scope=args.scan,
             bankroll=bankroll,
@@ -86,6 +109,7 @@ def main():
             primary_strategy=primary_strategy,
             top_k=args.top_k,
             history_period=args.period,
+            tickers_override=override_syms,
             available_cash=portfolio['available_cash'],
             open_tickers={p['ticker'] for p in portfolio['open_positions']},
             open_portfolio_risk=portfolio['open_portfolio_risk'],
@@ -99,7 +123,7 @@ def main():
         if scan_res['shortlist_summary_df'].empty:
             print('No eligible candidates matched your capital and risk constraints.')
             return
-        print('\n=== TOP SHORTLISTED S&P CANDIDATES ===')
+        print('\n=== TOP SHORTLISTED CANDIDATES ===')
         print(scan_res['shortlist_summary_df'].to_string(index=False))
         top_pick = scan_res['candidates'][0]
         prices, result = top_pick['data'], top_pick['workflow']
@@ -113,8 +137,13 @@ def main():
 
     print(f"\n=== TOP CANDIDATE 6-AGENT DETAIL ({result['ticker']}, as of {result['as_of']}) ===")
     print(f"[1. Market Data]   trend={result['market']['trend']} | close=${result['market']['price']:.2f} | vol_20d={result['market']['volatility_20_pct']:.1f}%")
-    print(f"[2. Research (AI)] sentiment={result['research']['sentiment']} ({result['research']['sentiment_score']:+.2f}) | mode={result['research']['ai_mode']}")
-    print(f"[3. Strategy]      {result['strategy']['strategy_name']} -> {result['strategy']['action']} (conviction {result['strategy']['conviction_score']:+d}/5)")
+    print(
+        f"[2. Research (AI)] sentiment={result['research']['sentiment']} ({result['research']['sentiment_score']:+.2f}) | "
+        f"flags={len(result['research'].get('event_flags', []))} | mode={result['research']['ai_mode']}"
+    )
+    ml_f = result['strategy'].get('ml_forecast')
+    ml_str = f" | ML P(up)={ml_f['p_up']:.0%} (acc {ml_f['backtest_accuracy']:.0%})" if ml_f else ''
+    print(f"[3. Strategy]      {result['strategy']['strategy_name']} -> {result['strategy']['action']} (conviction {result['strategy']['conviction_score']:+d}/5){ml_str}")
     print(f"[4. Risk Gate]     passed={result['risk']['passed']} ({result['risk']['decision']})")
     print(f"[6. Monitor Agent] status={result['monitor']['status']} | warnings={len(result['monitor']['warnings'])}")
 
@@ -129,7 +158,72 @@ def main():
     print(f"\n=== MULTI-STRATEGY HISTORICAL BACKTEST COMPARISON ({result['ticker']}, NO trades placed) ===")
     cols = ['Strategy', 'Category', 'Ending Equity ($)', 'Return (%)', 'Sharpe', 'Max Drawdown (%)', 'Closed Trades', 'Win Rate (%)']
     print(summary_df[cols].to_string(index=False))
+
+    if args.export_md:
+        out_path = Path(args.export_md)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        dossier_md = build_suggestion_report_markdown(result, summary_df, bankroll, policy)
+        out_path.write_text(dossier_md, encoding='utf-8')
+        print(f'\nSaved Markdown suggestion dossier to: {out_path}')
+
     print('\nUse: streamlit run app.py  for the interactive dashboard.')
+
+
+def run_schedule_loop(args) -> None:
+    """Keep running: pipeline weekdays at 16:45 America/New_York, Monitor check hourly at :05."""
+    ny_tz = ZoneInfo('America/New_York')
+    last_pipeline_day = None
+    last_monitor_hour = None
+    log.info('Scheduler started: pipeline weekdays 16:45 ET, monitor hourly (:05). Press Ctrl+C to stop.')
+    while True:
+        now_et = datetime.now(ny_tz)
+        if now_et.weekday() < 5 and now_et.hour == 16 and now_et.minute >= 45 and last_pipeline_day != now_et.date():
+            try:
+                run_once(args)
+            except Exception:
+                log.exception('Scheduled pipeline run failed')
+            last_pipeline_day = now_et.date()
+
+        hour_key = (now_et.date(), now_et.hour)
+        if now_et.minute >= 5 and last_monitor_hour != hour_key:
+            try:
+                run_monitor_mode()
+            except Exception:
+                log.exception('Scheduled monitor run failed')
+            last_monitor_hour = hour_key
+
+        time.sleep(30)
+
+
+def main():
+    strategy_choices = ['all'] + list(STRATEGIES.keys())
+    parser = argparse.ArgumentParser(description='S&P market scanner & 6-agent stock suggestion workflow (manual human decisions only)')
+    parser.add_argument(
+        '--mode',
+        choices=['once', 'watchlist', 'monitor', 'schedule'],
+        default='once',
+        help='Execution mode: once (S&P scan), watchlist (config/settings.yaml), monitor (scorecard & health), or schedule',
+    )
+    parser.add_argument('--scan', choices=['sp100', 'sp500'], default='sp100', help='Market scan universe when --ticker is omitted (default: sp100)')
+    parser.add_argument('--top-k', type=int, default=5, help='Number of top candidates to run through the 6-agent pipeline (default: 5)')
+    parser.add_argument('--ticker', default=None, help='Optional manual stock ticker override (skips market scan if provided)')
+    parser.add_argument('--bankroll', type=float, default=None, help='Starting paper trading capital ($)')
+    parser.add_argument('--risk', choices=['low', 'medium', 'high'], default=None, help='Risk tolerance level')
+    parser.add_argument('--period', default='2y', help='Yahoo Finance history window (e.g. 6mo, 1y, 2y, 5y)')
+    parser.add_argument('--strategy', choices=strategy_choices, default='all', help='Strategy key for backtest comparison, or all')
+    parser.add_argument('--export-md', default=None, help='Optional file path to save the candidate Markdown dossier (e.g. outputs/report.md)')
+    args = parser.parse_args()
+
+    if args.mode == 'monitor':
+        run_monitor_mode()
+    elif args.mode == 'schedule':
+        if args.bankroll is None:
+            args.bankroll = 10000.0
+        if args.risk is None:
+            args.risk = 'medium'
+        run_schedule_loop(args)
+    else:
+        run_once(args)
 
 
 if __name__ == '__main__':

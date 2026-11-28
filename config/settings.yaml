@@ -1,0 +1,27 @@
+# Shared settings for all agents. Humans edit this file; agents only read it.
+# Core Rule: Agents only suggest. Humans decide and trade manually.
+
+watchlist: [AAPL, MSFT, NVDA, JPM, SPY]
+
+market_data:
+  lookback_days: 730         # calendar days (~2y) of real daily bars for single-ticker deep dives
+
+research:
+  news_lookback_days: 3
+
+strategy:
+  horizon_days: 5            # predict forward direction over the next N trading days
+  min_history: 90            # minimum labeled rows needed before fitting walk-forward ML model
+  test_window: 40            # held-out recent trading days (with horizon embargo gap) to measure accuracy
+
+risk:
+  min_confidence: 0.53       # model probability floor for pure ML proposals
+  min_backtest_accuracy: 0.51
+  max_data_age_days: 5       # warn/reject if latest price bar is older than N calendar days
+  block_on_high_severity_days: 3
+  max_ideas_per_day: 10
+  kelly_fraction: 0.25       # quarter-Kelly informational reference
+  max_position_pct: 20.0     # default medium allocation cap (% of bankroll)
+
+monitor:
+  stale_after_hours: 30      # raise health warning if an agent has not recorded a heartbeat in this window

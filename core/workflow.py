@@ -5,6 +5,10 @@ Implements the 6-stage suggestion-only pipeline:
                     ├─► [3. Strategy] ─► [4. Risk Gate] ─► (No)  [Drop & Log Reason]
   [2. Research AI] ─┘                                   ─► (Yes) [5. Report AI] ◄─ [6. Monitor Agent] ─► Human Decision
 
+Also records per-agent health heartbeats, deduplicated research event flags, and
+proposals (both approved and Risk-rejected) so [6. Monitor Agent] can score both
+groups once their forward horizon passes.
+
 Agents only suggest. Humans decide and trade manually.
 """
 from pathlib import Path
@@ -17,7 +21,15 @@ from agents.research_agent import ResearchAgent
 from agents.risk_agent import RiskPolicy, evaluate_risk_gate, size_position
 from agents.strategy_agent import StrategyAgent
 from core.llm import LLMConfig
-from core.storage import DEFAULT_DB, save_dropped_idea, save_workflow_audit
+import core.storage as storage_mod
+from core.storage import (
+    record_heartbeat,
+    save_dropped_idea,
+    save_proposal,
+    save_research_flags,
+    save_workflow_audit,
+    score_past_proposals,
+)
 
 
 def analyze(
@@ -71,13 +83,29 @@ def run_suggestion_workflow(
 
     active_policy = policy or RiskPolicy()
     clean_ticker = ticker.strip().upper()
+    target_db = Path(db_path) if db_path is not None else storage_mod.DEFAULT_DB
 
     # [1. Market Data]
     data = DataAgent(source=source).collect(ticker=clean_ticker, period=period)
     market = MarketAgent().scan(data)
+    if log_to_db:
+        record_heartbeat('market_data', 'ok', f"{clean_ticker}: {len(data)} bars through {market['as_of']}", db_path=target_db)
 
     # [2. Research (AI)]
     research = ResearchAgent(llm_config=llm_config).research(ticker=clean_ticker, market=market)
+    if log_to_db:
+        save_research_flags(
+            symbol=clean_ticker,
+            flags=research.get('event_flags') or [],
+            source=str(research.get('flag_source') or 'keywords'),
+            db_path=target_db,
+        )
+        record_heartbeat(
+            'research',
+            'ok',
+            f"{clean_ticker}: {len(research.get('headlines', []))} headlines, {len(research.get('event_flags', []))} flag(s)",
+            db_path=target_db,
+        )
 
     # [3. Strategy]
     strategy_idea = StrategyAgent(primary_strategy=strategy).formulate(
@@ -85,6 +113,13 @@ def run_suggestion_workflow(
         market=market,
         research=research,
     )
+    if log_to_db:
+        record_heartbeat(
+            'strategy',
+            'ok',
+            f"{clean_ticker}: {strategy_idea['action']} (conviction {strategy_idea['conviction_score']:+d}/5)",
+            db_path=target_db,
+        )
 
     # [4. Risk Gate]
     risk_gate = evaluate_risk_gate(
@@ -98,8 +133,18 @@ def run_suggestion_workflow(
         open_portfolio_risk=open_portfolio_risk,
         sector_counts=sector_counts,
     )
+    if log_to_db:
+        record_heartbeat(
+            'risk',
+            'ok',
+            f"{clean_ticker}: {'APPROVED' if risk_gate['passed'] else 'REJECTED'}",
+            db_path=target_db,
+        )
 
     monitor_agent = MonitorAgent()
+    ml_info = strategy_idea.get('ml_forecast') or {}
+    ml_prob = float(ml_info.get('probability', 0.5)) if isinstance(ml_info, dict) else 0.5
+    ml_acc = float(ml_info.get('backtest_accuracy', 0.5)) if isinstance(ml_info, dict) else 0.5
 
     # Branch on [4. Risk Gate]
     if not risk_gate['passed']:
@@ -124,8 +169,22 @@ def run_suggestion_workflow(
                 drop_reasons=risk_gate['drop_reasons'],
                 conviction_score=strategy_idea['conviction_score'],
                 monitor_status=monitor['status'],
-                db_path=db_path,
+                db_path=target_db,
             )
+            save_proposal(
+                symbol=clean_ticker,
+                as_of=market['as_of'],
+                strategy=strategy_idea['strategy_name'],
+                direction='up' if strategy_idea['action'] == 'SUGGEST_LONG' else 'down',
+                entry_ref_price=strategy_idea['entry_reference_price'],
+                status='rejected',
+                horizon_days=int(strategy_idea.get('horizon_days', 5)),
+                probability=ml_prob,
+                backtest_accuracy=ml_acc,
+                conviction_score=strategy_idea['conviction_score'],
+                db_path=target_db,
+            )
+            score_past_proposals({clean_ticker: data}, db_path=target_db)
             save_workflow_audit(
                 ticker=clean_ticker,
                 strategy=strategy_idea['strategy_name'],
@@ -133,8 +192,9 @@ def run_suggestion_workflow(
                 monitor_status=monitor['status'],
                 warnings=monitor['warnings'],
                 headline=headline,
-                db_path=db_path,
+                db_path=target_db,
             )
+            record_heartbeat('monitor', 'ok', f"{clean_ticker}: {monitor['status']}", db_path=target_db)
         report = None
     else:
         # (Yes) -> [6. Monitor Agent] pre-checks -> [5. Report (AI)] -> [6. Monitor Agent] final report check
@@ -148,6 +208,7 @@ def run_suggestion_workflow(
             policy=active_policy,
             report=None,
         )
+        ideas_dir = (target_db.parent / 'reports' / 'ideas') if log_to_db else None
         report = ReportAgent(llm_config=llm_config).generate(
             ticker=clean_ticker,
             market=market,
@@ -156,6 +217,7 @@ def run_suggestion_workflow(
             risk_gate=risk_gate,
             monitor_precheck=precheck,
             bankroll=bankroll,
+            output_dir=ideas_dir,
         )
         monitor = monitor_agent.audit(
             df=data,
@@ -170,6 +232,21 @@ def run_suggestion_workflow(
         outcome = 'SUGGESTION_READY'
         headline = report['headline']
         if log_to_db:
+            record_heartbeat('report', 'ok', f"{clean_ticker}: wrote suggestion brief", db_path=target_db)
+            save_proposal(
+                symbol=clean_ticker,
+                as_of=market['as_of'],
+                strategy=strategy_idea['strategy_name'],
+                direction='up',
+                entry_ref_price=strategy_idea['entry_reference_price'],
+                status='approved',
+                horizon_days=int(strategy_idea.get('horizon_days', 5)),
+                probability=ml_prob,
+                backtest_accuracy=ml_acc,
+                conviction_score=strategy_idea['conviction_score'],
+                db_path=target_db,
+            )
+            score_past_proposals({clean_ticker: data}, db_path=target_db)
             save_workflow_audit(
                 ticker=clean_ticker,
                 strategy=strategy_idea['strategy_name'],
@@ -177,8 +254,9 @@ def run_suggestion_workflow(
                 monitor_status=monitor['status'],
                 warnings=monitor['warnings'],
                 headline=headline,
-                db_path=db_path,
+                db_path=target_db,
             )
+            record_heartbeat('monitor', 'ok', f"{clean_ticker}: {monitor['status']}", db_path=target_db)
 
     return data, {
         'ticker': clean_ticker,

@@ -3,6 +3,11 @@ import numpy as np
 import pandas as pd
 import pytest
 from agents.risk_agent import evaluate_risk_gate, get_risk_policy
+from core.exports import (
+    build_portfolio_report_markdown,
+    build_suggestion_report_markdown,
+    dataframe_to_csv_bytes,
+)
 from core.portfolio import evaluate_paper_portfolio, get_paper_cash_summary
 from core.storage import close_paper_position, list_paper_positions, open_paper_position
 
@@ -168,4 +173,76 @@ def test_legacy_paper_positions_schema_auto_migrates_sector_column(tmp_path):
     assert pos_id == 1
     summary = get_paper_cash_summary(10000.0, db_path=db)
     assert summary['sector_counts'] == {'Financial Services': 1}
+
+
+def test_spy_benchmark_alpha_and_markdown_csv_exports(tmp_path):
+    db = tmp_path / 'spy_bench.db'
+    pos_id = open_paper_position(
+        ticker='AAPL',
+        strategy='SMA 20/50 Crossover',
+        shares=20,
+        entry_price=150.0,
+        stop_price=142.5,
+        target_price=165.0,
+        sector='Technology',
+        db_path=db,
+    )
+    # Backdate opened_at_utc to 10 business days into our 80-day bar series so multi-day curve builds
+    dates = pd.bdate_range('2026-06-01', periods=80)
+    inception_iso = dates[50].isoformat()
+    with sqlite3.connect(db) as conn:
+        conn.execute('UPDATE paper_positions SET opened_at_utc = ? WHERE id = ?', (inception_iso, pos_id))
+
+    # AAPL rises from $150 to $180 (+$600 on $10,000 = +6.0% portfolio return)
+    aapl_close = np.linspace(140.0, 180.0, 80)
+    aapl_close[50] = 150.0
+    aapl_bars = pd.DataFrame(
+        {'Open': aapl_close, 'High': aapl_close + 1, 'Low': aapl_close - 1, 'Close': aapl_close, 'Volume': 20_000_000},
+        index=dates,
+    )
+    # SPY rises from $500 at index 50 to $515 at index 79 (+3.0% SPY return)
+    spy_close = np.linspace(480.0, 515.0, 80)
+    spy_close[50] = 500.0
+    spy_bars = pd.DataFrame(
+        {'Open': spy_close, 'High': spy_close + 1, 'Low': spy_close - 1, 'Close': spy_close, 'Volume': 50_000_000},
+        index=dates,
+    )
+
+    port = evaluate_paper_portfolio(
+        starting_bankroll=10000.0,
+        db_path=db,
+        bars_by_ticker={'AAPL': aapl_bars, 'SPY': spy_bars},
+    )
+    bench = port['spy_benchmark']
+    assert bench['available'] is True
+    assert port['total_return_pct'] == 6.0
+    assert bench['spy_return_pct'] == 3.0
+    assert bench['alpha_vs_spy_pct'] == 3.0
+    assert len(bench['curve_df']) == 30
+    assert list(bench['curve_df'].columns) == ['Paper Portfolio ($)', 'SPY Benchmark ($)']
+
+    # Verify Markdown & CSV exporters
+    port_md = build_portfolio_report_markdown(port, get_risk_policy('medium'))
+    assert 'SPY Benchmark' in port_md
+    assert '+3.00%' in port_md
+    assert 'AAPL' in port_md
+
+    csv_bytes = dataframe_to_csv_bytes(bench['curve_df'], include_index=True)
+    assert b'Paper Portfolio ($)' in csv_bytes
+
+    dummy_wf_result = {
+        'ticker': 'AAPL',
+        'as_of': '2026-09-18',
+        'outcome': 'SUGGESTION_READY',
+        'market': {'price': 180.0, 'trend': 'UP', 'sma_20': 172.0, 'sma_50': 162.0, 'momentum_20_pct': 5.2, 'volatility_20_pct': 18.5, 'volume_ratio': 1.1},
+        'research': {'sentiment': 'BULLISH', 'sentiment_score': 0.6, 'ai_mode': 'deterministic', 'summary': 'Strong demand.'},
+        'strategy': {'strategy_name': 'SMA 20/50 Crossover', 'action': 'SUGGEST_LONG', 'conviction_score': 4, 'bullish_strategies_count': 5, 'total_active_strategies': 6},
+        'risk': {'sector': 'Technology', 'passed': True, 'drop_reasons': []},
+        'report': {'markdown_report': '### Paper Trade Suggestion: AAPL\nAgents only suggest.'},
+        'monitor': {'status': 'HEALTHY', 'warnings': []},
+    }
+    dossier_md = build_suggestion_report_markdown(dummy_wf_result, None, 10000.0, get_risk_policy('medium'))
+    assert '# Multi-Agent Suggestion Dossier: AAPL (Technology)' in dossier_md
+    assert 'Agents only suggest' in dossier_md
+
 

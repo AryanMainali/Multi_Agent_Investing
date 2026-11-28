@@ -1,7 +1,11 @@
-"""Stage 3 [Strategy]: Synthesizes [1. Market Data] and [2. Research (AI)] into a structured trade candidate."""
+"""Stage 3 [Strategy]: Synthesizes [1. Market Data], [2. Research (AI)], multi-strategy signals,
+and a walk-forward Logistic Regression direction model into a structured trade candidate.
+"""
 from dataclasses import dataclass
 import pandas as pd
 from agents.analyst_agent import AnalystAgent
+from core.config import load_settings
+from core.ml_model import predict_walk_forward
 from core.strategies import STRATEGIES, _compute_rsi, generate_signals
 
 ACTIVE_STRATEGY_KEYS = [k for k, spec in STRATEGIES.items() if spec.uses_risk_policy]
@@ -43,6 +47,14 @@ def _evaluate_strategy_stance(prices: pd.DataFrame, key: str) -> dict:
     elif key == 'donchian_breakout':
         mid_20 = float(prices['Close'].rolling(20, min_periods=20).mean().iloc[-1])
         stance = 'BULLISH_TREND' if float(last['Close']) >= mid_20 else 'BEARISH_TREND'
+    elif key == 'ml_logistic_walkforward':
+        p_val = last.get('ML_P_UP')
+        if pd.notna(p_val) and float(p_val) >= 0.52:
+            stance = 'BULLISH_ML_FORECAST'
+        elif pd.notna(p_val) and float(p_val) <= 0.48:
+            stance = 'BEARISH_ML_FORECAST'
+        else:
+            stance = 'NEUTRAL'
     else:
         stance = 'NEUTRAL'
 
@@ -64,6 +76,15 @@ class StrategyAgent:
         key = self.primary_strategy if self.primary_strategy in ACTIVE_STRATEGY_KEYS else 'sma_crossover'
         spec = STRATEGIES[key]
         analyst = AnalystAgent().evaluate(df, market)
+
+        strat_cfg = load_settings().get('strategy', {})
+        horizon_days = int(strat_cfg.get('horizon_days', 5))
+        ml_forecast = predict_walk_forward(
+            df,
+            horizon_days=horizon_days,
+            min_history=int(strat_cfg.get('min_history', 90)),
+            test_window=int(strat_cfg.get('test_window', 40)),
+        )
 
         votes = {k: _evaluate_strategy_stance(df, k) for k in ACTIVE_STRATEGY_KEYS}
         primary_vote = votes[key]
@@ -95,15 +116,29 @@ class StrategyAgent:
             conviction -= 1
             rationale.append(f"Technical screening score is weak ({h_score:+d}; trend={market['trend']}).")
 
-        # 3. Multi-strategy agreement across the 6 active strategies
-        if bullish_count >= 4:
+        # 3. Multi-strategy agreement across all active strategies
+        majority_threshold = max(4, (len(ACTIVE_STRATEGY_KEYS) + 1) // 2)
+        if bullish_count >= majority_threshold:
             conviction += 1
             rationale.append(f"{bullish_count}/{len(ACTIVE_STRATEGY_KEYS)} active strategies align constructively.")
         elif bullish_count <= 1:
             conviction -= 1
             rationale.append(f"Only {bullish_count}/{len(ACTIVE_STRATEGY_KEYS)} active strategies show bullish posture.")
 
-        # 4. AI Research sentiment contribution
+        # 4. Walk-forward ML direction model (from team Strategy design)
+        if ml_forecast is not None:
+            p_up = float(ml_forecast['p_up'])
+            acc = float(ml_forecast['backtest_accuracy'])
+            if p_up >= 0.56 and acc >= 0.52:
+                conviction += 1
+            elif p_up <= 0.42 and acc >= 0.52:
+                conviction -= 1
+            rationale.append(
+                f"Walk-forward ML ({horizon_days}d logistic model): P(up)={p_up:.0%}, "
+                f"held-out accuracy={acc:.0%} over last {ml_forecast['test_window']} settled bars."
+            )
+
+        # 5. AI Research sentiment contribution
         sentiment = str(research.get('sentiment', 'NEUTRAL')).upper()
         if sentiment == 'BULLISH':
             conviction += 1
@@ -131,6 +166,8 @@ class StrategyAgent:
             'direction': direction,
             'action': action,
             'conviction_score': conviction,
+            'horizon_days': horizon_days,
+            'ml_forecast': ml_forecast,
             'entry_reference_price': analyst['price'],
             'analyst_screening': analyst,
             'bullish_strategies_count': bullish_count,
